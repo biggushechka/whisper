@@ -1,23 +1,29 @@
 FROM python:3.10-slim
 
-# Устанавливаем системные зависимости
+# Ставим системные библиотеки (ffmpeg нужен для Whisper)
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # Рабочая папка
 WORKDIR /app
 
-# Копируем зависимости
+# --- МАГИЯ ЗДЕСЬ ---
+# Создаем папки и ДАЕМ ПРАВА, чтобы не было ошибки Access Denied
+RUN mkdir -p /app/storage /app/cache /app/storage/files && \
+    chmod -R 777 /app/storage && \
+    chmod -R 777 /app/cache
+
+# Копируем список библиотек
 COPY requirements.txt .
+# Ставим библиотеки
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
+# Копируем сам код
 COPY app.py .
 
-# Создаем папку для кэша моделей, чтобы не качать их каждый раз
+# Настраиваем кэш для моделей Whisper (чтобы не качал каждый раз)
 ENV XDG_CACHE_HOME=/app/cache
-RUN mkdir -p /app/cache
 
-# Открываем порт Gradio
+# Открываем порт
 EXPOSE 7860
 
 # Запускаем
