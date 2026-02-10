@@ -16,12 +16,17 @@ TG_BOT_TOKEN = "8504609196:AAE-AXIpfytvvDigddCHMvTT9ukPp9m-SWw"
 TG_BOT_USERNAME = "whisper_log_bot"
 SITE_URL = "https://whisper.chernienko.pro" 
 
-# !!! ИСПРАВЛЕНИЕ: ПИШЕМ В КОРЕНЬ, ЧТОБЫ НЕ БЫЛО ОШИБОК ПРАВ !!!
-STORAGE_DIR = "/app"
-DB_PATH = os.path.join(STORAGE_DIR, "users.db")
-FILES_DIR = os.path.join(STORAGE_DIR, "files")
+# --- ИСПРАВЛЕНИЕ ПУТЕЙ ДЛЯ COOLIFY ---
+# В Coolify данные нужно хранить в /data, иначе они удалятся при обновлении
+DATA_DIR = "/data"
+if not os.path.exists(DATA_DIR):
+    DATA_DIR = "/app/data_local" # Фоллбэк для локального теста
 
-# Создаем папку для файлов
+DB_PATH = os.path.join(DATA_DIR, "users.db")
+FILES_DIR = os.path.join(DATA_DIR, "files")
+
+# Создаем папки
+os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(FILES_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(TG_BOT_TOKEN)
@@ -48,13 +53,14 @@ def init_db():
 
 init_db()
 
-# --- БОТ ---
+# --- БОТ (С ЗАЩИТОЙ ОТ ПАДЕНИЯ) ---
 def bot_polling():
     while True:
         try:
-            bot.polling(none_stop=True, interval=2)
+            print("🤖 Запуск бота...")
+            bot.polling(none_stop=True, interval=2, timeout=20)
         except Exception as e:
-            print(f"Bot error: {e}")
+            print(f"❌ Ошибка бота: {e}")
             time.sleep(5)
 
 @bot.message_handler(commands=['start'])
@@ -73,7 +79,7 @@ def handle_start(message):
         else:
             bot.reply_to(message, "Привет! Зайди на сайт, чтобы начать.")
     except Exception as e:
-        print(e)
+        print(f"Start error: {e}")
 
 threading.Thread(target=bot_polling, daemon=True).start()
 
@@ -96,6 +102,7 @@ def check_login_status(token):
 def load_model(model_size):
     global current_model, current_model_name
     if current_model_name != model_size:
+        print(f"🔄 Загрузка модели {model_size}...")
         current_model = whisper.load_model(model_size)
         current_model_name = model_size
     return current_model
@@ -105,10 +112,13 @@ def send_file_to_tg(user_id, filepath, caption):
         markup = InlineKeyboardMarkup()
         btn = InlineKeyboardButton("📂 В кабинет", url=SITE_URL)
         markup.add(btn)
-        with open(filepath, "rb") as f:
-            bot.send_document(user_id, f, caption=caption, reply_markup=markup)
+        if os.path.exists(filepath):
+            with open(filepath, "rb") as f:
+                bot.send_document(user_id, f, caption=caption, reply_markup=markup)
+        else:
+            bot.send_message(user_id, "Файл не найден на диске.")
     except Exception as e:
-        print(f"Ошибка отправки в ТГ: {e}")
+        print(f"Ошибка отправки ТГ: {e}")
 
 def process_single_file(user_id, file_path, original_name, model_size, task_id):
     try:
@@ -130,7 +140,7 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         doc.add_paragraph(f"Модель: {model_size}")
         doc.add_paragraph("\n".join(full_text))
         
-        res_filename = f"Transcription_{int(time.time())}.docx"
+        res_filename = f"Transcription_{int(time.time())}_{task_id}.docx"
         res_path = os.path.join(FILES_DIR, res_filename)
         doc.save(res_path)
         
@@ -141,8 +151,9 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         conn.close()
         send_file_to_tg(user_id, res_path, f"Готово: {original_name}")
     except Exception as e:
+        print(f"Error processing: {e}")
         conn = sqlite3.connect(DB_PATH)
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (f"❌ Ошибка: {str(e)}", task_id))
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (f"❌ Ошибка: {str(e)[:50]}", task_id))
         conn.commit()
         conn.close()
         bot.send_message(user_id, f"Ошибка с файлом {original_name}: {e}")
@@ -166,7 +177,7 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
                 t_start = time.strftime("%M:%S", time.gmtime(s['start']))
                 doc.add_paragraph(f"[{t_start}] — {s['text'].strip()}")
         
-        res_filename = f"MERGED_{int(time.time())}.docx"
+        res_filename = f"MERGED_{int(time.time())}_{task_id}.docx"
         res_path = os.path.join(FILES_DIR, res_filename)
         doc.save(res_path)
         
@@ -177,8 +188,9 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
         conn.close()
         send_file_to_tg(user_id, res_path, f"🔥 Сводный отчет готов ({len(file_list)} файлов)")
     except Exception as e:
+        print(f"Batch Error: {e}")
         conn = sqlite3.connect(DB_PATH)
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (f"❌ Ошибка: {str(e)}", task_id))
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (f"❌ Ошибка: {str(e)[:50]}", task_id))
         conn.commit()
         conn.close()
         bot.send_message(user_id, f"Ошибка пакета: {e}")
@@ -191,11 +203,16 @@ def add_task(user_id, files, model_size, merge_mode):
     saved_files = []
     
     for f in files:
-        original_name = os.path.basename(f.name) if hasattr(f, 'name') else os.path.basename(f)
-        saved_path = os.path.join(FILES_DIR, f"{int(time.time())}_{original_name}")
+        # Универсальная обработка загруженного файла (Gradio 4/5+)
+        f_path = f.name if hasattr(f, 'name') else f
+        original_name = os.path.basename(f_path)
+        
+        # Уникальное имя
+        safe_name = f"{int(time.time())}_{uuid.uuid4().hex[:6]}_{original_name}"
+        saved_path = os.path.join(FILES_DIR, safe_name)
+        
         import shutil
-        src = f.name if hasattr(f, 'name') else f
-        shutil.copy(src, saved_path)
+        shutil.copy(f_path, saved_path)
         saved_files.append((saved_path, original_name))
 
     msg = []
@@ -230,7 +247,8 @@ def get_history(user_id):
 js_save_session = """(user_id) => { if (user_id) { localStorage.setItem("whisper_user_id", user_id); } return user_id; }"""
 js_load_session = """() => { return localStorage.getItem("whisper_user_id"); }"""
 
-with gr.Blocks(title="Whisper Pro", css=".login-btn { font-size: 20px; }", allowed_paths=[STORAGE_DIR]) as demo:
+# !!! ИСПРАВЛЕНИЕ: Убрали allowed_paths и css из Blocks !!!
+with gr.Blocks(title="Whisper Pro") as demo:
     session_token = gr.State("") 
     user_id_state = gr.State("") 
     
@@ -278,4 +296,10 @@ with gr.Blocks(title="Whisper Pro", css=".login-btn { font-size: 20px; }", allow
     refresh_hist.click(get_history, inputs=[user_id_state], outputs=[hist_table])
     logout_btn.click(lambda: (gr.update(visible=True), gr.update(visible=False), ""), outputs=[login_screen, cabinet_screen, user_id_state]).then(fn=None, js="() => localStorage.removeItem('whisper_user_id')")
 
-demo.queue().launch(server_name="0.0.0.0", server_port=7860)
+# !!! ИСПРАВЛЕНИЕ: allowed_paths и css перенесены сюда !!!
+demo.queue().launch(
+    server_name="0.0.0.0", 
+    server_port=7860, 
+    allowed_paths=[DATA_DIR, "/data"],
+    css=".login-btn { font-size: 20px; }"
+)

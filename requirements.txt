@@ -3,3 +3,5 @@ openai-whisper
 python-docx
 requests
 pyTelegramBotAPI
+python-multipart
+ffmpeg-python
