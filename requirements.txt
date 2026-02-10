@@ -1,0 +1,4 @@
+gradio
+openai-whisper
+python-docx
+# ffmpeg ставится отдельно в системе, но тут python-обертки не нужны
