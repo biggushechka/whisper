@@ -18,7 +18,7 @@ TG_BOT_TOKEN = "8504609196:AAE-AXIpfytvvDigddCHMvTT9ukPp9m-SWw"
 TG_BOT_USERNAME = "whisper_log_bot"
 SITE_URL = "https://whisper.chernienko.pro" 
 
-# --- ИСПРАВЛЕНИЕ ПУТЕЙ ДЛЯ COOLIFY ---
+# --- ИСПРАВЛЕНИЕ ПУТЕЙ ДЛЯ COOLIFY/DOKPLOY ---
 DATA_DIR = "/data"
 if not os.path.exists(DATA_DIR):
     DATA_DIR = "/app/data_local" 
@@ -124,7 +124,6 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         conn.commit()
         conn.close()
 
-        # Загружаем модель только для этой задачи
         print(f"🔄 Загрузка {model_size} для файла {original_name}...")
         model = whisper.load_model(model_size)
         
@@ -185,7 +184,6 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
             doc.add_page_break()
             doc.add_heading(f"Файл: {f_name}", level=1)
             
-            # Обновляем статус в БД для текущего файла в пакете
             conn = sqlite3.connect(DB_PATH)
             conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (f"⏳ Обработка {f_name}...", task_id))
             conn.commit()
