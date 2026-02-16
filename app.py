@@ -3,10 +3,12 @@ import whisper
 import os
 import time
 import threading
-import requests
 import sqlite3
 import uuid
 import telebot
+import gc
+import torch
+import shutil
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime
 from docx import Document
@@ -17,23 +19,17 @@ TG_BOT_USERNAME = "whisper_log_bot"
 SITE_URL = "https://whisper.chernienko.pro" 
 
 # --- ИСПРАВЛЕНИЕ ПУТЕЙ ДЛЯ COOLIFY ---
-# В Coolify данные нужно хранить в /data, иначе они удалятся при обновлении
 DATA_DIR = "/data"
 if not os.path.exists(DATA_DIR):
-    DATA_DIR = "/app/data_local" # Фоллбэк для локального теста
+    DATA_DIR = "/app/data_local" 
 
 DB_PATH = os.path.join(DATA_DIR, "users.db")
 FILES_DIR = os.path.join(DATA_DIR, "files")
 
-# Создаем папки
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(FILES_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(TG_BOT_TOKEN)
-
-# Глобальная модель
-current_model = None
-current_model_name = ""
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
@@ -53,7 +49,7 @@ def init_db():
 
 init_db()
 
-# --- БОТ (С ЗАЩИТОЙ ОТ ПАДЕНИЯ) ---
+# --- БОТ ---
 def bot_polling():
     while True:
         try:
@@ -83,7 +79,7 @@ def handle_start(message):
 
 threading.Thread(target=bot_polling, daemon=True).start()
 
-# --- АВТОРИЗАЦИЯ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def generate_login_link():
     token = str(uuid.uuid4())
     link = f"https://t.me/{TG_BOT_USERNAME}?start={token}"
@@ -98,14 +94,13 @@ def check_login_status(token):
     conn.close()
     return result[0] if result else None
 
-# --- ТРАНСКРИБАЦИЯ ---
-def load_model(model_size):
-    global current_model, current_model_name
-    if current_model_name != model_size:
-        print(f"🔄 Загрузка модели {model_size}...")
-        current_model = whisper.load_model(model_size)
-        current_model_name = model_size
-    return current_model
+def unload_model(model_obj):
+    """Принудительная очистка оперативной памяти"""
+    del model_obj
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    print("🧹 Память очищена")
 
 def send_file_to_tg(user_id, filepath, caption):
     try:
@@ -120,14 +115,24 @@ def send_file_to_tg(user_id, filepath, caption):
     except Exception as e:
         print(f"Ошибка отправки ТГ: {e}")
 
+# --- ТРАНСКРИБАЦИЯ ---
 def process_single_file(user_id, file_path, original_name, model_size, task_id):
+    model = None
     try:
         conn = sqlite3.connect(DB_PATH)
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ В работе...", task_id))
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ Загрузка модели...", task_id))
         conn.commit()
         conn.close()
 
-        model = load_model(model_size)
+        # Загружаем модель только для этой задачи
+        print(f"🔄 Загрузка {model_size} для файла {original_name}...")
+        model = whisper.load_model(model_size)
+        
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ Транскрибация...", task_id))
+        conn.commit()
+        conn.close()
+
         result = model.transcribe(file_path, language="Russian")
         
         full_text = []
@@ -150,6 +155,7 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         conn.commit()
         conn.close()
         send_file_to_tg(user_id, res_path, f"Готово: {original_name}")
+
     except Exception as e:
         print(f"Error processing: {e}")
         conn = sqlite3.connect(DB_PATH)
@@ -157,21 +163,34 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         conn.commit()
         conn.close()
         bot.send_message(user_id, f"Ошибка с файлом {original_name}: {e}")
+    finally:
+        if model:
+            unload_model(model)
 
 def process_merged_batch(user_id, file_list, model_size, task_id):
+    model = None
     try:
         conn = sqlite3.connect(DB_PATH)
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ Обработка пакета...", task_id))
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ Загрузка модели для пакета...", task_id))
         conn.commit()
         conn.close()
         
-        model = load_model(model_size)
+        print(f"🔄 Загрузка {model_size} для пакета...")
+        model = whisper.load_model(model_size)
+        
         doc = Document()
         doc.add_paragraph(f"Сводная транскрибация (Файлов: {len(file_list)})")
         
         for f_path, f_name in file_list:
             doc.add_page_break()
             doc.add_heading(f"Файл: {f_name}", level=1)
+            
+            # Обновляем статус в БД для текущего файла в пакете
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (f"⏳ Обработка {f_name}...", task_id))
+            conn.commit()
+            conn.close()
+
             result = model.transcribe(f_path, language="Russian")
             for s in result.get('segments', []):
                 t_start = time.strftime("%M:%S", time.gmtime(s['start']))
@@ -194,38 +213,37 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
         conn.commit()
         conn.close()
         bot.send_message(user_id, f"Ошибка пакета: {e}")
+    finally:
+        if model:
+            unload_model(model)
 
 def add_task(user_id, files, model_size, merge_mode):
-    if not user_id: return "❌ Ошибка: Вы не авторизованы (попробуйте обновить страницу)"
+    if not user_id: return "❌ Ошибка: Вы не авторизованы"
     if not files: return "❌ Файлы не выбраны"
+    
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     saved_files = []
     
     for f in files:
-        # Универсальная обработка загруженного файла (Gradio 4/5+)
         f_path = f.name if hasattr(f, 'name') else f
         original_name = os.path.basename(f_path)
-        
-        # Уникальное имя
         safe_name = f"{int(time.time())}_{uuid.uuid4().hex[:6]}_{original_name}"
         saved_path = os.path.join(FILES_DIR, safe_name)
-        
-        import shutil
         shutil.copy(f_path, saved_path)
         saved_files.append((saved_path, original_name))
 
     msg = []
     if merge_mode and len(saved_files) > 1:
         cursor.execute("INSERT INTO tasks (user_id, filename, status, created_at) VALUES (?, ?, ?, ?)",
-                       (user_id, f"ПАКЕТ ({len(saved_files)} шт.)", "Очередь", datetime.now().strftime("%Y-%m-%d %H:%M")))
+                       (user_id, f"ПАКЕТ ({len(saved_files)} шт.)", "В очереди", datetime.now().strftime("%Y-%m-%d %H:%M")))
         task_id = cursor.lastrowid
         threading.Thread(target=process_merged_batch, args=(user_id, saved_files, model_size, task_id)).start()
         msg.append("Запущено объединение файлов...")
     else:
         for path, name in saved_files:
             cursor.execute("INSERT INTO tasks (user_id, filename, status, created_at) VALUES (?, ?, ?, ?)",
-                           (user_id, name, "Очередь", datetime.now().strftime("%Y-%m-%d %H:%M")))
+                           (user_id, name, "В очереди", datetime.now().strftime("%Y-%m-%d %H:%M")))
             task_id = cursor.lastrowid
             threading.Thread(target=process_single_file, args=(user_id, path, name, model_size, task_id)).start()
             msg.append(f"В очереди: {name}")
@@ -244,11 +262,11 @@ def get_history(user_id):
         out.append([t[0], t[1], t[2], path])
     return out
 
+# --- ИНТЕРФЕЙС GRADIO ---
 js_save_session = """(user_id) => { if (user_id) { localStorage.setItem("whisper_user_id", user_id); } return user_id; }"""
 js_load_session = """() => { return localStorage.getItem("whisper_user_id"); }"""
 
-# !!! ИСПРАВЛЕНИЕ: Убрали allowed_paths и css из Blocks !!!
-with gr.Blocks(title="Whisper Pro") as demo:
+with gr.Blocks(title="Whisper Pro", css=".login-btn { font-size: 20px; }") as demo:
     session_token = gr.State("") 
     user_id_state = gr.State("") 
     
@@ -275,31 +293,31 @@ with gr.Blocks(title="Whisper Pro") as demo:
 
     def on_load():
         token, link = generate_login_link()
-        html = f"""<div style="text-align: center; padding: 20px;"><a href="{link}" target="_blank" style="background-color: #2481cc; color: white; padding: 15px 30px; text-decoration: none; border-radius: 25px; font-size: 18px; font-family: sans-serif;">✈️ Войти через Telegram</a><p style="margin-top: 10px; color: #666;">Нажмите кнопку, запустите бота и возвращайтесь.</p></div>"""
+        html = f"""<div style="text-align: center; padding: 20px;"><a href="{link}" target="_blank" style="background-color: #2481cc; color: white; padding: 15px 30px; text-decoration: none; border-radius: 25px; font-size: 18px; font-family: sans-serif;">✈️ Войти через Telegram</a></div>"""
         return token, html
     
-    demo.load(on_load, outputs=[session_token, login_html]).then(fn=None, inputs=None, outputs=user_id_state, js=js_load_session).then(
+    demo.load(on_load, outputs=[session_token, login_html]).then(
+        fn=None, inputs=None, outputs=user_id_state, js=js_load_session
+    ).then(
         fn=lambda uid: (gr.update(visible=False), gr.update(visible=True)) if uid else (gr.update(visible=True), gr.update(visible=False)),
         inputs=[user_id_state], outputs=[login_screen, cabinet_screen]
     ).then(fn=get_history, inputs=[user_id_state], outputs=[hist_table])
 
-    def try_login(token):
-        uid = check_login_status(token)
-        if uid: return uid, gr.update(visible=False), gr.update(visible=True)
-        else: return "", gr.update(visible=True), gr.update(visible=False)
-
-    check_login_btn.click(try_login, inputs=[session_token], outputs=[user_id_state, login_screen, cabinet_screen]).then(
-        fn=None, inputs=[user_id_state], outputs=None, js=js_save_session
-    ).then(fn=get_history, inputs=[user_id_state], outputs=[hist_table])
+    check_login_btn.click(
+        fn=lambda token: (check_login_status(token), gr.update(visible=False), gr.update(visible=True)) if check_login_status(token) else ("", gr.update(visible=True), gr.update(visible=False)),
+        inputs=[session_token], outputs=[user_id_state, login_screen, cabinet_screen]
+    ).then(fn=None, inputs=[user_id_state], outputs=None, js=js_save_session).then(fn=get_history, inputs=[user_id_state], outputs=[hist_table])
 
     run_btn.click(add_task, inputs=[user_id_state, file_in, model_in, merge_in], outputs=[run_out])
     refresh_hist.click(get_history, inputs=[user_id_state], outputs=[hist_table])
-    logout_btn.click(lambda: (gr.update(visible=True), gr.update(visible=False), ""), outputs=[login_screen, cabinet_screen, user_id_state]).then(fn=None, js="() => localStorage.removeItem('whisper_user_id')")
+    
+    logout_btn.click(
+        lambda: (gr.update(visible=True), gr.update(visible=False), ""), 
+        outputs=[login_screen, cabinet_screen, user_id_state]
+    ).then(fn=None, js="() => localStorage.removeItem('whisper_user_id')")
 
-# !!! ИСПРАВЛЕНИЕ: allowed_paths и css перенесены сюда !!!
 demo.queue().launch(
     server_name="0.0.0.0", 
     server_port=7860, 
-    allowed_paths=[DATA_DIR, "/data"],
-    css=".login-btn { font-size: 20px; }"
+    allowed_paths=[DATA_DIR, "/data"]
 )
