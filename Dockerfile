@@ -1,19 +1,19 @@
 FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1
+# Переменные для оптимизации памяти
+ENV PYTHONMALLOC=malloc
+ENV MALLOC_TRIM_THRESHOLD_=100000
 
-# Ставим FFmpeg и необходимые системные библиотеки
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-# Установка зависимостей без кэша для экономии места
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-# Папка /data должна быть доступна для записи (монтируется в Dokploy)
 RUN mkdir -p /data && chmod -R 777 /data
 
 EXPOSE 7860
