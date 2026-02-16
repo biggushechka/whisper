@@ -1,22 +1,19 @@
 FROM python:3.10-slim
 
-# Показываем логи сразу
 ENV PYTHONUNBUFFERED=1
-
-# Ставим FFmpeg
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Ставим FFmpeg и необходимые системные библиотеки
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/* [cite: 2]
 
 WORKDIR /app
 
-# Копируем и ставим библиотеки
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Установка зависимостей без кэша для экономии места
+RUN pip install --no-cache-dir -r requirements.txt 
 
-# Копируем код
 COPY app.py .
 
-# Даем полные права на папку
-RUN chmod -R 777 /app
+# Папка /data должна быть доступна для записи (монтируется в Dokploy)
+RUN mkdir -p /data && chmod -R 777 /data [cite: 4]
 
 EXPOSE 7860
 
