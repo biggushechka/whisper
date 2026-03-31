@@ -251,21 +251,26 @@ with gr.Blocks(title="Whisper Pro") as demo:
 from fastapi import FastAPI, UploadFile, File
 import whisper
 
-# Получаем доступ к FastAPI, на котором крутится Gradio
+# --- ОТДЕЛЬНЫЙ ВХОД ДЛЯ n8n (НЕ ТРОГАЕТ САЙТ) ---
+from fastapi import UploadFile, File
+
 app = demo.app 
 
 @app.post("/asr")
 async def api_asr(audio_file: UploadFile = File(...)):
-    # Сохраняем временный файл
-    temp_path = f"/tmp/{audio_file.filename}"
+    import whisper
+    # Сохраняем во временную папку, чтобы не мусорить
+    temp_path = os.path.join(DATA_DIR, f"n8n_{audio_file.filename}")
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(audio_file.file, buffer)
     
-    # Запускаем Whisper (используем small для скорости)
-    model = whisper.load_model("small")
-    result = model.transcribe(temp_path, language="Russian")
-    
-    # Возвращаем текст для n8n
-    return {"text": result["text"]}
-    
+    try:
+        model = whisper.load_model("small")
+        result = model.transcribe(temp_path, language="Russian")
+        # ВОЗВРАЩАЕМ ТЕКСТ ОБРАТНО В n8n
+        return {"text": result["text"]}
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+            
 demo.queue().launch(server_name="0.0.0.0", server_port=7860, allowed_paths=[DATA_DIR])
