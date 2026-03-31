@@ -248,4 +248,24 @@ with gr.Blocks(title="Whisper Pro") as demo:
     refresh_btn.click(get_history, inputs=[user_id_state], outputs=[hist_table])
     logout_btn.click(lambda: ("", gr.update(visible=True), gr.update(visible=False)), outputs=[user_id_state, login_screen, cabinet_screen])
 
+from fastapi import FastAPI, UploadFile, File
+import whisper
+
+# Получаем доступ к FastAPI, на котором крутится Gradio
+app = demo.app 
+
+@app.post("/asr")
+async def api_asr(audio_file: UploadFile = File(...)):
+    # Сохраняем временный файл
+    temp_path = f"/tmp/{audio_file.filename}"
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(audio_file.file, buffer)
+    
+    # Запускаем Whisper (используем small для скорости)
+    model = whisper.load_model("small")
+    result = model.transcribe(temp_path, language="Russian")
+    
+    # Возвращаем текст для n8n
+    return {"text": result["text"]}
+    
 demo.queue().launch(server_name="0.0.0.0", server_port=7860, allowed_paths=[DATA_DIR])
