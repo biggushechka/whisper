@@ -248,29 +248,33 @@ with gr.Blocks(title="Whisper Pro") as demo:
     refresh_btn.click(get_history, inputs=[user_id_state], outputs=[hist_table])
     logout_btn.click(lambda: ("", gr.update(visible=True), gr.update(visible=False)), outputs=[user_id_state, login_screen, cabinet_screen])
 
+import uvicorn
 from fastapi import FastAPI, UploadFile, File
-import whisper
+import shutil
 
-# --- ОТДЕЛЬНЫЙ ВХОД ДЛЯ n8n (НЕ ТРОГАЕТ САЙТ) ---
-from fastapi import UploadFile, File
+# 1. Создаем нормальный сервер
+custom_app = FastAPI()
 
-app = demo.app 
-
-@app.post("/asr")
+# 2. Создаем тот самый путь для n8n
+@custom_app.post("/asr")
 async def api_asr(audio_file: UploadFile = File(...)):
-    import whisper
-    # Сохраняем во временную папку, чтобы не мусорить
     temp_path = os.path.join(DATA_DIR, f"n8n_{audio_file.filename}")
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(audio_file.file, buffer)
     
     try:
+        import whisper
         model = whisper.load_model("small")
         result = model.transcribe(temp_path, language="Russian")
-        # ВОЗВРАЩАЕМ ТЕКСТ ОБРАТНО В n8n
         return {"text": result["text"]}
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-            
+
+# 3. Прикручиваем твой интерфейс Gradio поверх нашего сервера
+custom_app = gr.mount_gradio_app(custom_app, demo.queue(), path="/")
+
+# 4. Запускаем правильным способом (вместо demo.launch)
+if __name__ == "__main__":
+    uvicorn.run(custom_app, host="0.0.0.0", port=7860)
 demo.queue().launch(server_name="0.0.0.0", server_port=7860, allowed_paths=[DATA_DIR])
