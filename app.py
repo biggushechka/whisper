@@ -11,9 +11,9 @@ from datetime import datetime
 from docx import Document
 
 # --- НАСТРОЙКИ ---
-TG_BOT_TOKEN = "8504609196:AAE-AXIpfytvvDigddCHMvTT9ukPp9m-SWw"
-TG_BOT_USERNAME = "whisper_log_bot"
-SITE_URL = "https://whisper.chernienko.pro" 
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8504609196:AAE-AXIpfytvvDigddCHMvTT9ukPp9m-SWw")
+TG_BOT_USERNAME = os.environ.get("TG_BOT_USERNAME", "whisper_log_bot")
+SITE_URL = os.environ.get("SITE_URL", "https://whisper.chernienko.pro") 
 
 DATA_DIR = "/data"
 if not os.path.exists(DATA_DIR):
@@ -83,11 +83,8 @@ def check_login_status(token):
 def unload_memory(obj=None):
     """Глубокая очистка памяти после задачи"""
     import gc
-    import torch
     if obj:
         del obj
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
     gc.collect()
     print("🧹 Память полностью очищена")
 
@@ -104,20 +101,20 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
     model = None
     try:
         # Динамический импорт только при запуске задачи
-        import whisper
+        from faster_whisper import WhisperModel
         
         conn = sqlite3.connect(DB_PATH)
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ Загрузка библиотек и модели...", task_id))
         conn.commit()
         conn.close()
 
-        model = whisper.load_model(model_size)
-        result = model.transcribe(file_path, language="Russian")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments, info = model.transcribe(file_path, language="ru", beam_size=5)
         
         full_text = []
-        for s in result.get('segments', []):
-            t_start = time.strftime("%M:%S", time.gmtime(s['start']))
-            full_text.append(f"[{t_start}] — {s['text'].strip()}")
+        for s in segments:
+            t_start = time.strftime("%M:%S", time.gmtime(s.start))
+            full_text.append(f"[{t_start}] — {s.text.strip()}")
             
         doc = Document()
         doc.add_paragraph(f"Файл: {original_name}\nМодель: {model_size}\n\n" + "\n".join(full_text))
@@ -132,6 +129,9 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         send_file_to_tg(user_id, res_path, f"Готово: {original_name}")
 
     except Exception as e:
+        import traceback
+        print(f"Error in process_single_file: {e}")
+        traceback.print_exc()
         conn = sqlite3.connect(DB_PATH)
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (f"❌ Ошибка: {str(e)[:40]}", task_id))
         conn.commit()
@@ -142,24 +142,24 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
 def process_merged_batch(user_id, file_list, model_size, task_id):
     model = None
     try:
-        import whisper
+        from faster_whisper import WhisperModel
         
         conn = sqlite3.connect(DB_PATH)
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ Работа с пакетом...", task_id))
         conn.commit()
         conn.close()
         
-        model = whisper.load_model(model_size)
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
         doc = Document()
         doc.add_paragraph(f"Сводный отчет (Файлов: {len(file_list)})")
         
         for f_path, f_name in file_list:
             doc.add_page_break()
             doc.add_heading(f"Файл: {f_name}", level=1)
-            result = model.transcribe(f_path, language="Russian")
-            for s in result.get('segments', []):
-                t_start = time.strftime("%M:%S", time.gmtime(s['start']))
-                doc.add_paragraph(f"[{t_start}] — {s['text'].strip()}")
+            segments, info = model.transcribe(f_path, language="ru", beam_size=5)
+            for s in segments:
+                t_start = time.strftime("%M:%S", time.gmtime(s.start))
+                doc.add_paragraph(f"[{t_start}] — {s.text.strip()}")
         
         res_path = os.path.join(FILES_DIR, f"MERGED_{int(time.time())}_{task_id}.docx")
         doc.save(res_path)
@@ -169,6 +169,14 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
         conn.commit()
         conn.close()
         send_file_to_tg(user_id, res_path, "🔥 Сводный отчет готов")
+    except Exception as e:
+        import traceback
+        print(f"Error in process_merged_batch: {e}")
+        traceback.print_exc()
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (f"❌ Ошибка: {str(e)[:40]}", task_id))
+        conn.commit()
+        conn.close()
     finally:
         unload_memory(model)
 
@@ -263,10 +271,11 @@ async def api_asr(audio_file: UploadFile = File(...)):
         shutil.copyfileobj(audio_file.file, buffer)
     
     try:
-        import whisper
-        model = whisper.load_model("small")
-        result = model.transcribe(temp_path, language="Russian")
-        return {"text": result["text"]}
+        from faster_whisper import WhisperModel
+        model = WhisperModel("small", device="cpu", compute_type="int8")
+        segments, info = model.transcribe(temp_path, language="ru", beam_size=5)
+        text = "".join(s.text for s in segments)
+        return {"text": text}
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)

@@ -1,8 +1,7 @@
 gradio
-openai-whisper
+faster-whisper
 python-docx
 requests
 pyTelegramBotAPI
 python-multipart
 ffmpeg-python
-torch --index-url https://download.pytorch.org/whl/cpu

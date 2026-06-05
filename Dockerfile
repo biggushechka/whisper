@@ -4,6 +4,8 @@ ENV PYTHONUNBUFFERED=1
 # Переменные для оптимизации памяти
 ENV PYTHONMALLOC=malloc
 ENV MALLOC_TRIM_THRESHOLD_=100000
+ENV HF_HOME=/data/hf_cache
+
 
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 

@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  whisper:
+    build: .
+    container_name: whisper-pro
+    restart: always
+    ports:
+      - "7860:7860"
+    volumes:
+      - whisper_data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONMALLOC=malloc
+      - MALLOC_TRIM_THRESHOLD_=100000
+      - HF_HOME=/data/hf_cache
+      # Вы можете настроить токены/ссылку через переменные окружения здесь или в панели Dokploy:
+      # - TG_BOT_TOKEN=8504609196:AAE-AXIpfytvvDigddCHMvTT9ukPp9m-SWw
+      # - TG_BOT_USERNAME=whisper_log_bot
+      # - SITE_URL=https://whisper.chernienko.pro
+
+volumes:
+  whisper_data:
+    driver: local
