@@ -97,24 +97,43 @@ def send_file_to_tg(user_id, filepath, caption):
         pass
 
 # --- ТРАНСКРИБАЦИЯ ---
-def process_single_file(user_id, file_path, original_name, model_size, task_id):
+def process_single_file(user_id, file_path, original_name, model_size, task_id, progress=None, progress_desc=""):
     model = None
     try:
         # Динамический импорт только при запуске задачи
         from faster_whisper import WhisperModel
         
+        if progress:
+            progress(0.05, desc=f"{progress_desc} — Загрузка модели...")
+            
         conn = sqlite3.connect(DB_PATH)
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ Загрузка библиотек и модели...", task_id))
         conn.commit()
         conn.close()
 
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        
+        if progress:
+            progress(0.2, desc=f"{progress_desc} — Транскрибация аудио...")
+            
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ Транскрибация...", task_id))
+        conn.commit()
+        conn.close()
+        
         segments, info = model.transcribe(file_path, language="ru", beam_size=5)
         
+        duration = info.duration
         full_text = []
         for s in segments:
             t_start = time.strftime("%M:%S", time.gmtime(s.start))
             full_text.append(f"[{t_start}] — {s.text.strip()}")
+            if progress and duration > 0:
+                current_prog = 0.2 + (s.end / duration) * 0.6
+                progress(current_prog, desc=f"{progress_desc} — Расшифровано {int(s.end)}/{int(duration)} сек...")
+            
+        if progress:
+            progress(0.85, desc=f"{progress_desc} — Создание документа...")
             
         doc = Document()
         doc.add_paragraph(f"Файл: {original_name}\nМодель: {model_size}\n\n" + "\n".join(full_text))
@@ -122,11 +141,17 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         res_path = os.path.join(FILES_DIR, f"Transcription_{int(time.time())}_{task_id}.docx")
         doc.save(res_path)
         
+        if progress:
+            progress(0.95, desc=f"{progress_desc} — Отправка в Telegram...")
+            
         conn = sqlite3.connect(DB_PATH)
         conn.execute("UPDATE tasks SET status = ?, result_path = ? WHERE id = ?", ("✅ Готово", res_path, task_id))
         conn.commit()
         conn.close()
         send_file_to_tg(user_id, res_path, f"Готово: {original_name}")
+        
+        if progress:
+            progress(1.0, desc=f"{progress_desc} — Готово!")
 
     except Exception as e:
         import traceback
@@ -139,11 +164,14 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
     finally:
         unload_memory(model)
 
-def process_merged_batch(user_id, file_list, model_size, task_id):
+def process_merged_batch(user_id, file_list, model_size, task_id, progress=None):
     model = None
     try:
         from faster_whisper import WhisperModel
         
+        if progress:
+            progress(0.05, desc="Загрузка модели...")
+            
         conn = sqlite3.connect(DB_PATH)
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("⏳ Работа с пакетом...", task_id))
         conn.commit()
@@ -153,22 +181,41 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
         doc = Document()
         doc.add_paragraph(f"Сводный отчет (Файлов: {len(file_list)})")
         
-        for f_path, f_name in file_list:
+        for idx, (f_path, f_name) in enumerate(file_list):
             doc.add_page_break()
             doc.add_heading(f"Файл: {f_name}", level=1)
+            
+            if progress:
+                progress(0.1 + (idx / len(file_list)) * 0.8, desc=f"Файл {idx+1}/{len(file_list)}: {f_name}...")
+                
             segments, info = model.transcribe(f_path, language="ru", beam_size=5)
+            duration = info.duration
             for s in segments:
                 t_start = time.strftime("%M:%S", time.gmtime(s.start))
                 doc.add_paragraph(f"[{t_start}] — {s.text.strip()}")
+                if progress and duration > 0:
+                    file_progress = s.end / duration
+                    overall_progress = 0.1 + ((idx + file_progress) / len(file_list)) * 0.8
+                    progress(overall_progress, desc=f"Файл {idx+1}/{len(file_list)}: {f_name} — {int(s.end)}/{int(duration)} сек...")
         
+        if progress:
+            progress(0.9, desc="Создание сводного отчета...")
+            
         res_path = os.path.join(FILES_DIR, f"MERGED_{int(time.time())}_{task_id}.docx")
         doc.save(res_path)
         
+        if progress:
+            progress(0.95, desc="Отправка в Telegram...")
+            
         conn = sqlite3.connect(DB_PATH)
         conn.execute("UPDATE tasks SET status = ?, result_path = ? WHERE id = ?", ("✅ Пакет готов", res_path, task_id))
         conn.commit()
         conn.close()
         send_file_to_tg(user_id, res_path, "🔥 Сводный отчет готов")
+        
+        if progress:
+            progress(1.0, desc="Готово!")
+            
     except Exception as e:
         import traceback
         print(f"Error in process_merged_batch: {e}")
@@ -180,12 +227,15 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
     finally:
         unload_memory(model)
 
-def add_task(user_id, files, model_size, merge_mode):
+def add_task(user_id, files, model_size, merge_mode, progress=gr.Progress()):
     if not user_id or not files: return "❌ Ошибка"
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     saved_files = []
     
+    if progress:
+        progress(0.01, desc="Копирование файлов...")
+        
     for f in files:
         f_path = f.name if hasattr(f, 'name') else f
         safe_name = f"{int(time.time())}_{uuid.uuid4().hex[:4]}_{os.path.basename(f_path)}"
@@ -196,16 +246,25 @@ def add_task(user_id, files, model_size, merge_mode):
     if merge_mode and len(saved_files) > 1:
         cursor.execute("INSERT INTO tasks (user_id, filename, status, created_at) VALUES (?, ?, ?, ?)",
                        (user_id, f"ПАКЕТ ({len(saved_files)})", "Очередь", datetime.now().strftime("%Y-%m-%d %H:%M")))
-        threading.Thread(target=process_merged_batch, args=(user_id, saved_files, model_size, cursor.lastrowid)).start()
+        task_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        process_merged_batch(user_id, saved_files, model_size, task_id, progress)
     else:
-        for path, name in saved_files:
+        conn.commit()
+        conn.close()
+        for i, (path, name) in enumerate(saved_files):
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
             cursor.execute("INSERT INTO tasks (user_id, filename, status, created_at) VALUES (?, ?, ?, ?)",
                            (user_id, name, "Очередь", datetime.now().strftime("%Y-%m-%d %H:%M")))
-            threading.Thread(target=process_single_file, args=(user_id, path, name, model_size, cursor.lastrowid)).start()
+            task_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            progress_desc = f"Файл {i+1}/{len(saved_files)}: {name}"
+            process_single_file(user_id, path, name, model_size, task_id, progress, progress_desc)
     
-    conn.commit()
-    conn.close()
-    return "✅ Добавлено в очередь"
+    return "✅ Транскрибация завершена! Результаты отправлены в Telegram."
 
 def get_history(user_id):
     if not user_id: return []
@@ -230,7 +289,7 @@ with gr.Blocks(title="Whisper Pro") as demo:
             logout_btn = gr.Button("Выйти", size="sm")
         with gr.Tabs():
             with gr.Tab("Загрузка"):
-                file_in = gr.File(file_count="multiple", label="Аудио/Видео")
+                file_in = gr.File(file_count="multiple", label="Аудио/Видео", file_types=["audio", "video", ".webm"])
                 model_in = gr.Dropdown(["small", "medium"], value="small", label="Модель")
                 merge_in = gr.Checkbox(label="Объединить в один файл", value=False)
                 run_btn = gr.Button("🚀 Начать транскрибацию", variant="primary")
