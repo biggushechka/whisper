@@ -92,7 +92,7 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
             full_text.append(f"[{t_start}] — {s.text.strip()}")
             
             curr_time = time.time()
-            if duration > 0 and (curr_time - last_update > 4):
+            if duration > 0 and (curr_time - last_update > 3):
                 percent = min(99, int((s.end / duration) * 100))
                 status_str = f"⏳ Расшифровано {percent}% ({int(s.end)}/{int(duration)} сек)"
                 db_update_status(task_id, status_str)
@@ -146,7 +146,7 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
                 doc.add_paragraph(f"[{t_start}] — {s.text.strip()}")
                 
                 curr_time = time.time()
-                if duration > 0 and (curr_time - last_update > 4):
+                if duration > 0 and (curr_time - last_update > 3):
                     file_progress = s.end / duration
                     overall_progress = (idx + file_progress) / len(file_list)
                     percent = min(99, int(overall_progress * 100))
@@ -239,8 +239,6 @@ def worker_loop():
             time.sleep(2)
 
 threading.Thread(target=worker_loop, daemon=True).start()
-
-# При старте сервера запускаем восстановление незавершенных задач
 recover_pending_tasks()
 
 # --- БОТ ---
@@ -346,32 +344,32 @@ def format_status_progress_bar(status_text):
         percent = int(match.group(1))
         percent = max(0, min(100, percent))
         return f'''
-        <div style="background:#2a2e39;border-radius:10px;width:100%;min-width:180px;height:24px;overflow:hidden;position:relative;box-shadow:inset 0 1px 3px rgba(0,0,0,0.4);">
+        <div style="background:#2a2e39;border-radius:10px;width:100%;min-width:200px;height:26px;overflow:hidden;position:relative;box-shadow:inset 0 1px 3px rgba(0,0,0,0.5);">
           <div style="background:linear-gradient(90deg, #2481cc, #00d2ff);width:{percent}%;height:100%;transition:width 0.4s ease-in-out;"></div>
-          <span style="position:absolute;top:0;left:0;width:100%;height:100%;text-align:center;line-height:24px;font-size:12px;font-weight:bold;color:#ffffff;text-shadow:0 1px 2px rgba(0,0,0,0.9);">{status_text}</span>
+          <span style="position:absolute;top:0;left:0;width:100%;height:100%;text-align:center;line-height:26px;font-size:12px;font-weight:bold;color:#ffffff;text-shadow:0 1px 2px rgba(0,0,0,0.9);">{status_text}</span>
         </div>
         '''
     elif "Очередь" in status_text:
         return '''
-        <div style="background:#3a321e;border-radius:10px;width:100%;min-width:180px;height:24px;line-height:24px;text-align:center;font-size:12px;font-weight:bold;color:#ffc107;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
+        <div style="background:#3a321e;border-radius:10px;width:100%;min-width:200px;height:26px;line-height:26px;text-align:center;font-size:12px;font-weight:bold;color:#ffc107;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
           ⏳ В очереди...
         </div>
         '''
     elif "✅" in status_text:
         return f'''
-        <div style="background:#1e3a29;border-radius:10px;width:100%;min-width:180px;height:24px;line-height:24px;text-align:center;font-size:12px;font-weight:bold;color:#4caf50;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
+        <div style="background:#1e3a29;border-radius:10px;width:100%;min-width:200px;height:26px;line-height:26px;text-align:center;font-size:12px;font-weight:bold;color:#4caf50;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
           {status_text}
         </div>
         '''
     elif "❌" in status_text:
         return f'''
-        <div style="background:#3a1e1e;border-radius:10px;width:100%;min-width:180px;height:24px;line-height:24px;text-align:center;font-size:12px;font-weight:bold;color:#f44336;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
+        <div style="background:#3a1e1e;border-radius:10px;width:100%;min-width:200px;height:26px;line-height:26px;text-align:center;font-size:12px;font-weight:bold;color:#f44336;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
           {status_text}
         </div>
         '''
     else:
         return f'''
-        <div style="background:#2a2e39;border-radius:10px;width:100%;min-width:180px;height:24px;line-height:24px;text-align:center;font-size:12px;font-weight:bold;color:#e0e0e0;">
+        <div style="background:#2a2e39;border-radius:10px;width:100%;min-width:200px;height:26px;line-height:26px;text-align:center;font-size:12px;font-weight:bold;color:#e0e0e0;">
           {status_text}
         </div>
         '''
@@ -400,32 +398,59 @@ def get_history(user_id):
         
     return formatted
 
-# --- ИНТЕРФЕЙС GRADIO ---
-custom_head = """
-<script>
-function syncWhisperSession() {
-    try {
-        const savedToken = localStorage.getItem("whisper_session_token");
-        if (savedToken) {
-            const tokenBox = document.querySelector("#session_token_box textarea, #session_token_box input");
-            const checkBtn = document.querySelector("#check_login_btn");
-            if (tokenBox && checkBtn && (!tokenBox.value || tokenBox.value !== savedToken)) {
-                tokenBox.value = savedToken;
-                tokenBox.dispatchEvent(new Event('input', { bubbles: true }));
-                setTimeout(() => { checkBtn.click(); }, 300);
-            }
-        }
-    } catch(e) { console.error("Session sync error:", e); }
-}
+def get_active_task_progress(user_id):
+    """Возвращает прогресс-бар активной задачи для вкладки Загрузка"""
+    if not user_id:
+        return ""
+    conn = sqlite3.connect(DB_PATH)
+    task = conn.execute("SELECT filename, status FROM tasks WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+    conn.close()
+    
+    if not task:
+        return ""
+        
+    fname, raw_status = task
+    bar_html = format_status_progress_bar(raw_status)
+    return f'''
+    <div style="margin-top:15px;padding:12px;background:#1a1d24;border:1px solid #333948;border-radius:10px;">
+      <div style="font-size:13px;font-weight:bold;color:#a0a6b8;margin-bottom:6px;">📊 Текущий статус транскрибации ({fname}):</div>
+      {bar_html}
+    </div>
+    '''
 
-setInterval(syncWhisperSession, 1000);
-document.addEventListener("DOMContentLoaded", syncWhisperSession);
+# --- ИНТЕРФЕЙС GRADIO ---
+session_script_html = """
+<script>
+(function() {
+    function checkAndRestoreSession() {
+        try {
+            const savedToken = localStorage.getItem("whisper_session_token");
+            if (savedToken) {
+                const tokenBox = document.querySelector("#session_token_box textarea, #session_token_box input");
+                const checkBtn = document.querySelector("#check_login_btn");
+                if (tokenBox && checkBtn) {
+                    if (!tokenBox.value || tokenBox.value !== savedToken) {
+                        tokenBox.value = savedToken;
+                        tokenBox.dispatchEvent(new Event('input', { bubbles: true }));
+                        setTimeout(function() { checkBtn.click(); }, 200);
+                    }
+                }
+            }
+        } catch(e) { console.error("Session sync error:", e); }
+    }
+
+    setInterval(checkAndRestoreSession, 800);
+    window.addEventListener("load", checkAndRestoreSession);
+})();
 </script>
 """
 
-with gr.Blocks(title="Whisper Pro", head=custom_head) as demo:
+with gr.Blocks(title="Whisper Pro") as demo:
     user_id_state = gr.State("")
     session_token = gr.State("")
+    
+    # Внедряем скрипт работы с localStorage напрямую в DOM
+    gr.HTML(session_script_html, visible=True)
     
     with gr.Group(visible=True) as login_screen:
         gr.Markdown("# 👋 Вход")
@@ -444,6 +469,7 @@ with gr.Blocks(title="Whisper Pro", head=custom_head) as demo:
                 merge_in = gr.Checkbox(label="Объединить в один файл", value=False)
                 run_btn = gr.Button("🚀 Начать транскрибацию", variant="primary")
                 run_out = gr.Textbox(label="Результат")
+                live_progress = gr.HTML(label="Прогресс задачи")
             with gr.Tab("История"):
                 refresh_btn = gr.Button("🔄 Обновить")
                 hist_table = gr.Dataframe(
@@ -452,7 +478,7 @@ with gr.Blocks(title="Whisper Pro", head=custom_head) as demo:
                     interactive=False
                 )
 
-    refresh_timer = gr.Timer(5)
+    refresh_timer = gr.Timer(3)
 
     def on_load():
         token = str(uuid.uuid4())
@@ -479,11 +505,13 @@ with gr.Blocks(title="Whisper Pro", head=custom_head) as demo:
             }
             return [token, input_token];
         }"""
-    ).then(get_history, inputs=[user_id_state], outputs=[hist_table])
+    ).then(get_history, inputs=[user_id_state], outputs=[hist_table]).then(get_active_task_progress, inputs=[user_id_state], outputs=[live_progress])
 
-    run_btn.click(add_task, inputs=[user_id_state, file_in, model_in, merge_in], outputs=[run_out])
-    refresh_btn.click(get_history, inputs=[user_id_state], outputs=[hist_table])
-    refresh_timer.tick(get_history, inputs=[user_id_state], outputs=[hist_table])
+    run_btn.click(add_task, inputs=[user_id_state, file_in, model_in, merge_in], outputs=[run_out]).then(get_active_task_progress, inputs=[user_id_state], outputs=[live_progress])
+    
+    refresh_btn.click(get_history, inputs=[user_id_state], outputs=[hist_table]).then(get_active_task_progress, inputs=[user_id_state], outputs=[live_progress])
+    
+    refresh_timer.tick(get_history, inputs=[user_id_state], outputs=[hist_table]).then(get_active_task_progress, inputs=[user_id_state], outputs=[live_progress])
 
     def do_logout():
         return "", "", gr.update(visible=True), gr.update(visible=False)
