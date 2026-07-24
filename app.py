@@ -500,6 +500,9 @@ with gr.Blocks(title="Whisper Pro") as demo:
         # Если не авторизован, остаемся на экране входа
         return "", token_from_on_load, gr.update(visible=True), gr.update(visible=False), ""
 
+    def save_session_token_js(token):
+        return token
+
     check_login_btn.click(
         try_login, 
         inputs=[session_token, user_id_state], 
@@ -509,7 +512,7 @@ with gr.Blocks(title="Whisper Pro") as demo:
             return [token, current_uid, saved || ""];
         }"""
     ).then(
-        fn=None,
+        save_session_token_js,
         inputs=[session_token],
         outputs=[],
         js="""(token) => {
