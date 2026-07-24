@@ -56,6 +56,125 @@ def db_update_status(task_id, status_str):
     except Exception as e:
         print(f"Error updating task status: {e}")
 
+def unload_memory(obj=None):
+    """Глубокая очистка памяти после задачи"""
+    import gc
+    if obj:
+        del obj
+    gc.collect()
+    print("🧹 Память полностью очищена")
+
+def send_file_to_tg(user_id, filepath, caption):
+    try:
+        if os.path.exists(filepath):
+            with open(filepath, "rb") as f:
+                bot.send_document(user_id, f, caption=caption)
+    except Exception as e:
+        print(f"Error sending file to TG: {e}")
+
+# --- ФУНКЦИИ ОБРАБОТКИ ТРАНСКРИБАЦИИ ---
+def process_single_file(user_id, file_path, original_name, model_size, task_id):
+    model = None
+    try:
+        from faster_whisper import WhisperModel
+        
+        db_update_status(task_id, "⏳ Загрузка модели...")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        
+        db_update_status(task_id, "⏳ Расшифровка 0%")
+        segments, info = model.transcribe(file_path, language="ru", beam_size=5)
+        
+        duration = info.duration
+        full_text = []
+        last_update = 0
+        for s in segments:
+            t_start = time.strftime("%M:%S", time.gmtime(s.start))
+            full_text.append(f"[{t_start}] — {s.text.strip()}")
+            
+            curr_time = time.time()
+            if duration > 0 and (curr_time - last_update > 4):
+                percent = min(99, int((s.end / duration) * 100))
+                status_str = f"⏳ Расшифровано {percent}% ({int(s.end)}/{int(duration)} сек)"
+                db_update_status(task_id, status_str)
+                last_update = curr_time
+            
+        db_update_status(task_id, "⏳ Создание документа...")
+        doc = Document()
+        doc.add_paragraph(f"Файл: {original_name}\nМодель: {model_size}\n\n" + "\n".join(full_text))
+        
+        res_path = os.path.join(FILES_DIR, f"Transcription_{int(time.time())}_{task_id}.docx")
+        doc.save(res_path)
+        
+        db_update_status(task_id, "⏳ Отправка в Telegram...")
+        
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tasks SET status = ?, result_path = ? WHERE id = ?", ("✅ Готово", res_path, task_id))
+        conn.commit()
+        conn.close()
+        
+        send_file_to_tg(user_id, res_path, f"Готово: {original_name}")
+
+    except Exception as e:
+        import traceback
+        print(f"Error in process_single_file: {e}")
+        traceback.print_exc()
+        db_update_status(task_id, f"❌ Ошибка: {str(e)[:40]}")
+    finally:
+        unload_memory(model)
+
+def process_merged_batch(user_id, file_list, model_size, task_id):
+    model = None
+    try:
+        from faster_whisper import WhisperModel
+        
+        db_update_status(task_id, "⏳ Загрузка модели...")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        doc = Document()
+        doc.add_paragraph(f"Сводный отчет (Файлов: {len(file_list)})")
+        
+        last_update = 0
+        for idx, (f_path, f_name) in enumerate(file_list):
+            doc.add_page_break()
+            doc.add_heading(f"Файл: {f_name}", level=1)
+            
+            db_update_status(task_id, f"⏳ Файл {idx+1}/{len(file_list)}: {f_name}...")
+            
+            segments, info = model.transcribe(f_path, language="ru", beam_size=5)
+            duration = info.duration
+            for s in segments:
+                t_start = time.strftime("%M:%S", time.gmtime(s.start))
+                doc.add_paragraph(f"[{t_start}] — {s.text.strip()}")
+                
+                curr_time = time.time()
+                if duration > 0 and (curr_time - last_update > 4):
+                    file_progress = s.end / duration
+                    overall_progress = (idx + file_progress) / len(file_list)
+                    percent = min(99, int(overall_progress * 100))
+                    status_str = f"⏳ Файл {idx+1}/{len(file_list)} — {percent}% ({int(s.end)}/{int(duration)} сек)"
+                    db_update_status(task_id, status_str)
+                    last_update = curr_time
+        
+        db_update_status(task_id, "⏳ Создание сводного отчета...")
+        res_path = os.path.join(FILES_DIR, f"MERGED_{int(time.time())}_{task_id}.docx")
+        doc.save(res_path)
+        
+        db_update_status(task_id, "⏳ Отправка в Telegram...")
+        
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tasks SET status = ?, result_path = ? WHERE id = ?", ("✅ Пакет готов", res_path, task_id))
+        conn.commit()
+        conn.close()
+        
+        send_file_to_tg(user_id, res_path, "🔥 Сводный отчет готов")
+            
+    except Exception as e:
+        import traceback
+        print(f"Error in process_merged_batch: {e}")
+        traceback.print_exc()
+        db_update_status(task_id, f"❌ Ошибка: {str(e)[:40]}")
+    finally:
+        unload_memory(model)
+
 # --- ФОНОВАЯ ОЧЕРЕДЬ ЗАДАЧ ---
 task_queue = queue.Queue()
 
@@ -165,124 +284,6 @@ def check_login_status(token):
     result = cursor.fetchone()
     conn.close()
     return result[0] if result else None
-
-def unload_memory(obj=None):
-    """Глубокая очистка памяти после задачи"""
-    import gc
-    if obj:
-        del obj
-    gc.collect()
-    print("🧹 Память полностью очищена")
-
-def send_file_to_tg(user_id, filepath, caption):
-    try:
-        if os.path.exists(filepath):
-            with open(filepath, "rb") as f:
-                bot.send_document(user_id, f, caption=caption)
-    except Exception as e:
-        print(f"Error sending file to TG: {e}")
-
-def process_single_file(user_id, file_path, original_name, model_size, task_id):
-    model = None
-    try:
-        from faster_whisper import WhisperModel
-        
-        db_update_status(task_id, "⏳ Загрузка модели...")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        
-        db_update_status(task_id, "⏳ Расшифровка 0%")
-        segments, info = model.transcribe(file_path, language="ru", beam_size=5)
-        
-        duration = info.duration
-        full_text = []
-        last_update = 0
-        for s in segments:
-            t_start = time.strftime("%M:%S", time.gmtime(s.start))
-            full_text.append(f"[{t_start}] — {s.text.strip()}")
-            
-            curr_time = time.time()
-            if duration > 0 and (curr_time - last_update > 4):
-                percent = min(99, int((s.end / duration) * 100))
-                status_str = f"⏳ Расшифровано {percent}% ({int(s.end)}/{int(duration)} сек)"
-                db_update_status(task_id, status_str)
-                last_update = curr_time
-            
-        db_update_status(task_id, "⏳ Создание документа...")
-        doc = Document()
-        doc.add_paragraph(f"Файл: {original_name}\nМодель: {model_size}\n\n" + "\n".join(full_text))
-        
-        res_path = os.path.join(FILES_DIR, f"Transcription_{int(time.time())}_{task_id}.docx")
-        doc.save(res_path)
-        
-        db_update_status(task_id, "⏳ Отправка в Telegram...")
-        
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("UPDATE tasks SET status = ?, result_path = ? WHERE id = ?", ("✅ Готово", res_path, task_id))
-        conn.commit()
-        conn.close()
-        
-        send_file_to_tg(user_id, res_path, f"Готово: {original_name}")
-
-    except Exception as e:
-        import traceback
-        print(f"Error in process_single_file: {e}")
-        traceback.print_exc()
-        db_update_status(task_id, f"❌ Ошибка: {str(e)[:40]}")
-    finally:
-        unload_memory(model)
-
-def process_merged_batch(user_id, file_list, model_size, task_id):
-    model = None
-    try:
-        from faster_whisper import WhisperModel
-        
-        db_update_status(task_id, "⏳ Загрузка модели...")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        doc = Document()
-        doc.add_paragraph(f"Сводный отчет (Файлов: {len(file_list)})")
-        
-        last_update = 0
-        for idx, (f_path, f_name) in enumerate(file_list):
-            doc.add_page_break()
-            doc.add_heading(f"Файл: {f_name}", level=1)
-            
-            db_update_status(task_id, f"⏳ Файл {idx+1}/{len(file_list)}: {f_name}...")
-            
-            segments, info = model.transcribe(f_path, language="ru", beam_size=5)
-            duration = info.duration
-            for s in segments:
-                t_start = time.strftime("%M:%S", time.gmtime(s.start))
-                doc.add_paragraph(f"[{t_start}] — {s.text.strip()}")
-                
-                curr_time = time.time()
-                if duration > 0 and (curr_time - last_update > 4):
-                    file_progress = s.end / duration
-                    overall_progress = (idx + file_progress) / len(file_list)
-                    percent = min(99, int(overall_progress * 100))
-                    status_str = f"⏳ Файл {idx+1}/{len(file_list)} — {percent}% ({int(s.end)}/{int(duration)} сек)"
-                    db_update_status(task_id, status_str)
-                    last_update = curr_time
-        
-        db_update_status(task_id, "⏳ Создание сводного отчета...")
-        res_path = os.path.join(FILES_DIR, f"MERGED_{int(time.time())}_{task_id}.docx")
-        doc.save(res_path)
-        
-        db_update_status(task_id, "⏳ Отправка в Telegram...")
-        
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("UPDATE tasks SET status = ?, result_path = ? WHERE id = ?", ("✅ Пакет готов", res_path, task_id))
-        conn.commit()
-        conn.close()
-        
-        send_file_to_tg(user_id, res_path, "🔥 Сводный отчет готов")
-            
-    except Exception as e:
-        import traceback
-        print(f"Error in process_merged_batch: {e}")
-        traceback.print_exc()
-        db_update_status(task_id, f"❌ Ошибка: {str(e)[:40]}")
-    finally:
-        unload_memory(model)
 
 def add_task(user_id, files, model_size, merge_mode):
     if not user_id or not files: return "❌ Ошибка: Пользователь не авторизован или файлы не выбраны"
