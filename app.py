@@ -70,7 +70,7 @@ def recover_pending_tasks():
             matched_file = None
             if os.path.exists(FILES_DIR):
                 for fname in os.listdir(FILES_DIR):
-                    if fname.endswith(f"_{original_name}"):
+                    if fname.endswith(original_name):
                         matched_file = os.path.join(FILES_DIR, fname)
                         break
             
@@ -87,6 +87,7 @@ def recover_pending_tasks():
                     "task_id": task_id
                 })
             else:
+                print(f"⚠️ Файл для задачи {task_id} не найден: {original_name}")
                 c.execute("UPDATE tasks SET status = '❌ Файл не найден' WHERE id = ?", (task_id,))
                 conn.commit()
         conn.close()
