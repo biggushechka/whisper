@@ -422,25 +422,20 @@ def get_active_task_progress(user_id):
 session_script_html = """
 <script>
 (function() {
-    function checkAndRestoreSession() {
+    function autoCheckSession() {
         try {
-            const savedToken = localStorage.getItem("whisper_session_token");
-            if (savedToken) {
-                const tokenBox = document.querySelector("#session_token_box textarea, #session_token_box input");
-                const checkBtn = document.querySelector("#check_login_btn");
-                if (tokenBox && checkBtn) {
-                    if (!tokenBox.value || tokenBox.value !== savedToken) {
-                        tokenBox.value = savedToken;
-                        tokenBox.dispatchEvent(new Event('input', { bubbles: true }));
-                        setTimeout(function() { checkBtn.click(); }, 200);
-                    }
+            const saved = localStorage.getItem("whisper_session_token");
+            if (saved) {
+                const btn = document.querySelector("#check_login_btn");
+                if (btn) {
+                    btn.click();
                 }
             }
-        } catch(e) { console.error("Session sync error:", e); }
+        } catch(e) { console.error("Auto check error:", e); }
     }
 
-    setInterval(checkAndRestoreSession, 800);
-    window.addEventListener("load", checkAndRestoreSession);
+    setTimeout(autoCheckSession, 400);
+    window.addEventListener("load", autoCheckSession);
 })();
 </script>
 """
@@ -449,13 +444,12 @@ with gr.Blocks(title="Whisper Pro") as demo:
     user_id_state = gr.State("")
     session_token = gr.State("")
     
-    # Внедряем скрипт работы с localStorage напрямую в DOM
+    # Внедряем JS прямо в страницу
     gr.HTML(session_script_html, visible=True)
     
     with gr.Group(visible=True) as login_screen:
         gr.Markdown("# 👋 Вход")
         login_html = gr.HTML()
-        token_box = gr.Textbox(elem_id="session_token_box", visible=False)
         check_login_btn = gr.Button("🔄 Проверить вход", elem_id="check_login_btn", variant="primary")
     
     with gr.Group(visible=False) as cabinet_screen:
@@ -487,23 +481,27 @@ with gr.Blocks(title="Whisper Pro") as demo:
     
     demo.load(on_load, outputs=[session_token, login_html])
 
-    def try_login(token, input_token):
-        tok = input_token if input_token else token
-        uid = check_login_status(tok)
+    def try_login(token_param, current_user_id):
+        # Если пользователь уже авторизован
+        if current_user_id:
+            return current_user_id, token_param, gr.update(visible=False), gr.update(visible=True)
+            
+        uid = check_login_status(token_param)
         if uid:
-            return uid, tok, gr.update(visible=False), gr.update(visible=True)
-        return "", token, gr.update(visible=True), gr.update(visible=False)
+            return uid, token_param, gr.update(visible=False), gr.update(visible=True)
+        return "", token_param, gr.update(visible=True), gr.update(visible=False)
 
     check_login_btn.click(
         try_login, 
-        inputs=[session_token, token_box], 
+        inputs=[session_token, user_id_state], 
         outputs=[user_id_state, session_token, login_screen, cabinet_screen],
-        js="""(token, input_token) => {
-            const tok = input_token || token;
-            if (tok) {
-                try { localStorage.setItem("whisper_session_token", tok); } catch(e){}
+        js="""(token, current_uid) => {
+            const saved = localStorage.getItem("whisper_session_token");
+            const targetToken = saved ? saved : token;
+            if (targetToken) {
+                try { localStorage.setItem("whisper_session_token", targetToken); } catch(e){}
             }
-            return [token, input_token];
+            return [targetToken, current_uid];
         }"""
     ).then(get_history, inputs=[user_id_state], outputs=[hist_table]).then(get_active_task_progress, inputs=[user_id_state], outputs=[live_progress])
 
