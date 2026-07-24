@@ -434,7 +434,7 @@ session_script_html = """
         } catch(e) { console.error("Auto check error:", e); }
     }
 
-    setTimeout(autoCheckSession, 400);
+    setTimeout(autoCheckSession, 300);
     window.addEventListener("load", autoCheckSession);
 })();
 </script>
@@ -444,7 +444,6 @@ with gr.Blocks(title="Whisper Pro") as demo:
     user_id_state = gr.State("")
     session_token = gr.State("")
     
-    # Внедряем JS прямо в страницу
     gr.HTML(session_script_html, visible=True)
     
     with gr.Group(visible=True) as login_screen:
@@ -481,15 +480,25 @@ with gr.Blocks(title="Whisper Pro") as demo:
     
     demo.load(on_load, outputs=[session_token, login_html])
 
-    def try_login(token_param, current_user_id):
-        # Если пользователь уже авторизован
+    def try_login(token_from_on_load, current_user_id, token_from_js):
+        # 1. Если текущий state уже содержит авторизованный user_id
         if current_user_id:
-            return current_user_id, token_param, gr.update(visible=False), gr.update(visible=True)
-            
-        uid = check_login_status(token_param)
-        if uid:
-            return uid, token_param, gr.update(visible=False), gr.update(visible=True)
-        return "", token_param, gr.update(visible=True), gr.update(visible=False)
+            return current_user_id, token_from_on_load, gr.update(visible=False), gr.update(visible=True), ""
+
+        # 2. Проверяем сохраненный токен из localStorage (переданный из JS)
+        if token_from_js:
+            uid = check_login_status(token_from_js)
+            if uid:
+                return uid, token_from_js, gr.update(visible=False), gr.update(visible=True), token_from_js
+
+        # 3. Проверяем токен текущей сессии (от нажатия кнопки Telegram)
+        if token_from_on_load:
+            uid = check_login_status(token_from_on_load)
+            if uid:
+                return uid, token_from_on_load, gr.update(visible=False), gr.update(visible=True), token_from_on_load
+
+        # Если не авторизован, остаемся на экране входа
+        return "", token_from_on_load, gr.update(visible=True), gr.update(visible=False), ""
 
     check_login_btn.click(
         try_login, 
@@ -497,11 +506,16 @@ with gr.Blocks(title="Whisper Pro") as demo:
         outputs=[user_id_state, session_token, login_screen, cabinet_screen],
         js="""(token, current_uid) => {
             const saved = localStorage.getItem("whisper_session_token");
-            const targetToken = saved ? saved : token;
-            if (targetToken) {
-                try { localStorage.setItem("whisper_session_token", targetToken); } catch(e){}
+            return [token, current_uid, saved || ""];
+        }"""
+    ).then(
+        fn=None,
+        inputs=[session_token],
+        outputs=[],
+        js="""(token) => {
+            if (token) {
+                try { localStorage.setItem("whisper_session_token", token); } catch(e){}
             }
-            return [targetToken, current_uid];
         }"""
     ).then(get_history, inputs=[user_id_state], outputs=[hist_table]).then(get_active_task_progress, inputs=[user_id_state], outputs=[live_progress])
 
