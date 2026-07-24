@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 import telebot
 import shutil
+import re
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime
 from docx import Document
@@ -41,8 +42,6 @@ def init_db():
                   status TEXT, 
                   result_path TEXT, 
                   created_at TEXT)''')
-    # Сбрасываем незавершенные задачи из прошлых запусков контейнера
-    c.execute("UPDATE tasks SET status = '❌ Прервано при перезапуске' WHERE status LIKE '⏳%' OR status = 'Очередь'")
     conn.commit()
     conn.close()
 
@@ -59,6 +58,40 @@ def db_update_status(task_id, status_str):
 
 # --- ФОНОВАЯ ОЧЕРЕДЬ ЗАДАЧ ---
 task_queue = queue.Queue()
+
+def recover_pending_tasks():
+    """Автоматически восстанавливает и перезапускает нерасшифрованные задачи при старте контейнера"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id, user_id, filename, status FROM tasks WHERE status LIKE '⏳%' OR status = 'Очередь' OR status LIKE '%Прервано%'")
+        rows = c.fetchall()
+        for task_id, user_id, original_name, status in rows:
+            matched_file = None
+            if os.path.exists(FILES_DIR):
+                for fname in os.listdir(FILES_DIR):
+                    if fname.endswith(f"_{original_name}"):
+                        matched_file = os.path.join(FILES_DIR, fname)
+                        break
+            
+            if matched_file and os.path.exists(matched_file):
+                print(f"🔄 Автоматическое восстановление задачи {task_id}: {original_name}")
+                c.execute("UPDATE tasks SET status = 'Очередь' WHERE id = ?", (task_id,))
+                conn.commit()
+                task_queue.put({
+                    "type": "single",
+                    "user_id": user_id,
+                    "file_path": matched_file,
+                    "original_name": original_name,
+                    "model_size": "small",
+                    "task_id": task_id
+                })
+            else:
+                c.execute("UPDATE tasks SET status = '❌ Файл не найден' WHERE id = ?", (task_id,))
+                conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error in recover_pending_tasks: {e}")
 
 def worker_loop():
     while True:
@@ -87,12 +120,16 @@ def worker_loop():
 
 threading.Thread(target=worker_loop, daemon=True).start()
 
+# При старте сервера запускаем восстановление незавершенных задач
+recover_pending_tasks()
+
 # --- БОТ ---
 def bot_polling():
     while True:
         try:
             bot.polling(none_stop=True, interval=2, timeout=20)
-        except Exception:
+        except Exception as e:
+            print(f"Bot polling exception: {e}")
             time.sleep(5)
 
 @bot.message_handler(commands=['start'])
@@ -108,10 +145,9 @@ def handle_start(message):
             conn.commit()
             conn.close()
             bot.reply_to(message, "✅ Авторизовано! Вернитесь на сайт.")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error in handle_start: {e}")
 
-# Перед запуском бота очищаем возможные старые вебхуки (например, от n8n)
 try:
     print("Clearing active webhooks to resolve 409 Conflict...")
     bot.remove_webhook()
@@ -142,18 +178,18 @@ def send_file_to_tg(user_id, filepath, caption):
         if os.path.exists(filepath):
             with open(filepath, "rb") as f:
                 bot.send_document(user_id, f, caption=caption)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error sending file to TG: {e}")
 
 def process_single_file(user_id, file_path, original_name, model_size, task_id):
     model = None
     try:
         from faster_whisper import WhisperModel
         
-        db_update_status(task_id, "⏳ Загрузка библиотек и модели...")
+        db_update_status(task_id, "⏳ Загрузка модели...")
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
         
-        db_update_status(task_id, "⏳ Транскрибация...")
+        db_update_status(task_id, "⏳ Расшифровка 0%")
         segments, info = model.transcribe(file_path, language="ru", beam_size=5)
         
         duration = info.duration
@@ -164,8 +200,8 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
             full_text.append(f"[{t_start}] — {s.text.strip()}")
             
             curr_time = time.time()
-            if duration > 0 and (curr_time - last_update > 5):
-                percent = int((s.end / duration) * 100)
+            if duration > 0 and (curr_time - last_update > 4):
+                percent = min(99, int((s.end / duration) * 100))
                 status_str = f"⏳ Расшифровано {percent}% ({int(s.end)}/{int(duration)} сек)"
                 db_update_status(task_id, status_str)
                 last_update = curr_time
@@ -199,7 +235,7 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
     try:
         from faster_whisper import WhisperModel
         
-        db_update_status(task_id, "⏳ Загрузка библиотек и модели...")
+        db_update_status(task_id, "⏳ Загрузка модели...")
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
         doc = Document()
         doc.add_paragraph(f"Сводный отчет (Файлов: {len(file_list)})")
@@ -218,10 +254,10 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
                 doc.add_paragraph(f"[{t_start}] — {s.text.strip()}")
                 
                 curr_time = time.time()
-                if duration > 0 and (curr_time - last_update > 5):
+                if duration > 0 and (curr_time - last_update > 4):
                     file_progress = s.end / duration
                     overall_progress = (idx + file_progress) / len(file_list)
-                    percent = int(overall_progress * 100)
+                    percent = min(99, int(overall_progress * 100))
                     status_str = f"⏳ Файл {idx+1}/{len(file_list)} — {percent}% ({int(s.end)}/{int(duration)} сек)"
                     db_update_status(task_id, status_str)
                     last_update = curr_time
@@ -298,27 +334,107 @@ def add_task(user_id, files, model_size, merge_mode):
             
     return "✅ Добавлено в очередь! Вы можете закрыть браузер, результаты придут в Telegram."
 
+def format_status_progress_bar(status_text):
+    """Преобразует текстовый статус в красивый горизонтальный HTML Progress Bar"""
+    if not status_text:
+        return ""
+    
+    match = re.search(r'(\d+)%', status_text)
+    if match and ("Расшифровано" in status_text or "Файл" in status_text or "%" in status_text):
+        percent = int(match.group(1))
+        percent = max(0, min(100, percent))
+        return f'''
+        <div style="background:#2a2e39;border-radius:10px;width:100%;min-width:180px;height:24px;overflow:hidden;position:relative;box-shadow:inset 0 1px 3px rgba(0,0,0,0.4);">
+          <div style="background:linear-gradient(90deg, #2481cc, #00d2ff);width:{percent}%;height:100%;transition:width 0.4s ease-in-out;"></div>
+          <span style="position:absolute;top:0;left:0;width:100%;height:100%;text-align:center;line-height:24px;font-size:12px;font-weight:bold;color:#ffffff;text-shadow:0 1px 2px rgba(0,0,0,0.9);">{status_text}</span>
+        </div>
+        '''
+    elif "Очередь" in status_text:
+        return '''
+        <div style="background:#3a321e;border-radius:10px;width:100%;min-width:180px;height:24px;line-height:24px;text-align:center;font-size:12px;font-weight:bold;color:#ffc107;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
+          ⏳ В очереди...
+        </div>
+        '''
+    elif "✅" in status_text:
+        return f'''
+        <div style="background:#1e3a29;border-radius:10px;width:100%;min-width:180px;height:24px;line-height:24px;text-align:center;font-size:12px;font-weight:bold;color:#4caf50;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
+          {status_text}
+        </div>
+        '''
+    elif "❌" in status_text:
+        return f'''
+        <div style="background:#3a1e1e;border-radius:10px;width:100%;min-width:180px;height:24px;line-height:24px;text-align:center;font-size:12px;font-weight:bold;color:#f44336;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
+          {status_text}
+        </div>
+        '''
+    else:
+        return f'''
+        <div style="background:#2a2e39;border-radius:10px;width:100%;min-width:180px;height:24px;line-height:24px;text-align:center;font-size:12px;font-weight:bold;color:#e0e0e0;">
+          {status_text}
+        </div>
+        '''
+
 def get_history(user_id):
     if not user_id: return []
     conn = sqlite3.connect(DB_PATH)
     tasks = conn.execute("SELECT created_at, filename, status, result_path FROM tasks WHERE user_id = ? ORDER BY id DESC LIMIT 15", (user_id,)).fetchall()
     conn.close()
-    return [[t[0], t[1], t[2], t[3] if (t[3] and os.path.exists(t[3])) else None] for t in tasks]
+    
+    formatted = []
+    for t in tasks:
+        date_str = t[0]
+        fname = t[1]
+        raw_status = t[2]
+        rpath = t[3]
+        
+        status_html = format_status_progress_bar(raw_status)
+        
+        if rpath and os.path.exists(rpath):
+            file_link = f"📄 Готово ({os.path.basename(rpath)})"
+        else:
+            file_link = "—"
+            
+        formatted.append([date_str, fname, status_html, file_link])
+        
+    return formatted
 
-# --- ИНТЕРФЕЙС ---
-with gr.Blocks(title="Whisper Pro") as demo:
+# --- ИНТЕРФЕЙС GRADIO ---
+custom_head = """
+<script>
+function syncWhisperSession() {
+    try {
+        const savedToken = localStorage.getItem("whisper_session_token");
+        if (savedToken) {
+            const tokenBox = document.querySelector("#session_token_box textarea, #session_token_box input");
+            const checkBtn = document.querySelector("#check_login_btn");
+            if (tokenBox && checkBtn && (!tokenBox.value || tokenBox.value !== savedToken)) {
+                tokenBox.value = savedToken;
+                tokenBox.dispatchEvent(new Event('input', { bubbles: true }));
+                setTimeout(() => { checkBtn.click(); }, 300);
+            }
+        }
+    } catch(e) { console.error("Session sync error:", e); }
+}
+
+setInterval(syncWhisperSession, 1000);
+document.addEventListener("DOMContentLoaded", syncWhisperSession);
+</script>
+"""
+
+with gr.Blocks(title="Whisper Pro", head=custom_head) as demo:
     user_id_state = gr.State("")
     session_token = gr.State("")
     
     with gr.Group(visible=True) as login_screen:
         gr.Markdown("# 👋 Вход")
         login_html = gr.HTML()
-        check_login_btn = gr.Button("🔄 Проверить вход", variant="primary")
+        token_box = gr.Textbox(elem_id="session_token_box", visible=False)
+        check_login_btn = gr.Button("🔄 Проверить вход", elem_id="check_login_btn", variant="primary")
     
     with gr.Group(visible=False) as cabinet_screen:
         with gr.Row():
             gr.Markdown("# 📂 Кабинет")
-            logout_btn = gr.Button("Выйти", size="sm")
+            logout_btn = gr.Button("Выйти", elem_id="logout_btn", size="sm")
         with gr.Tabs():
             with gr.Tab("Загрузка"):
                 file_in = gr.File(file_count="multiple", label="Аудио/Видео", file_types=["audio", "video", ".webm"])
@@ -328,7 +444,13 @@ with gr.Blocks(title="Whisper Pro") as demo:
                 run_out = gr.Textbox(label="Результат")
             with gr.Tab("История"):
                 refresh_btn = gr.Button("🔄 Обновить")
-                hist_table = gr.Dataframe(headers=["Дата", "Файл", "Статус", "Путь"], interactive=False)
+                hist_table = gr.Dataframe(
+                    headers=["Дата", "Файл", "Прогресс / Статус", "Файл отчета"],
+                    datatype=["str", "str", "html", "str"],
+                    interactive=False
+                )
+
+    refresh_timer = gr.Timer(5)
 
     def on_load():
         token = str(uuid.uuid4())
@@ -337,24 +459,44 @@ with gr.Blocks(title="Whisper Pro") as demo:
     
     demo.load(on_load, outputs=[session_token, login_html])
 
-    def try_login(token):
-        uid = check_login_status(token)
-        if uid: return uid, gr.update(visible=False), gr.update(visible=True)
-        return "", gr.update(visible=True), gr.update(visible=False)
+    def try_login(token, input_token):
+        tok = input_token if input_token else token
+        uid = check_login_status(tok)
+        if uid:
+            return uid, tok, gr.update(visible=False), gr.update(visible=True)
+        return "", token, gr.update(visible=True), gr.update(visible=False)
 
-    check_login_btn.click(try_login, inputs=[session_token], outputs=[user_id_state, login_screen, cabinet_screen]).then(get_history, inputs=[user_id_state], outputs=[hist_table])
+    check_login_btn.click(
+        try_login, 
+        inputs=[session_token, token_box], 
+        outputs=[user_id_state, session_token, login_screen, cabinet_screen],
+        js="""(token, input_token) => {
+            const tok = input_token || token;
+            if (tok) {
+                try { localStorage.setItem("whisper_session_token", tok); } catch(e){}
+            }
+            return [token, input_token];
+        }"""
+    ).then(get_history, inputs=[user_id_state], outputs=[hist_table])
+
     run_btn.click(add_task, inputs=[user_id_state, file_in, model_in, merge_in], outputs=[run_out])
     refresh_btn.click(get_history, inputs=[user_id_state], outputs=[hist_table])
-    logout_btn.click(lambda: ("", gr.update(visible=True), gr.update(visible=False)), outputs=[user_id_state, login_screen, cabinet_screen])
+    refresh_timer.tick(get_history, inputs=[user_id_state], outputs=[hist_table])
+
+    def do_logout():
+        return "", "", gr.update(visible=True), gr.update(visible=False)
+
+    logout_btn.click(
+        do_logout, 
+        outputs=[user_id_state, session_token, login_screen, cabinet_screen],
+        js="() => { try { localStorage.removeItem('whisper_session_token'); } catch(e){} }"
+    )
 
 import uvicorn
 from fastapi import FastAPI, UploadFile, File
-import shutil
 
-# 1. Создаем нормальный сервер
 custom_app = FastAPI()
 
-# 2. Создаем тот самый путь для n8n
 @custom_app.post("/asr")
 async def api_asr(audio_file: UploadFile = File(...)):
     temp_path = os.path.join(DATA_DIR, f"n8n_{audio_file.filename}")
@@ -371,10 +513,7 @@ async def api_asr(audio_file: UploadFile = File(...)):
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-# 3. Прикручиваем твой интерфейс Gradio поверх нашего сервера
 custom_app = gr.mount_gradio_app(custom_app, demo.queue(), path="/")
 
-# 4. Запускаем правильным способом (вместо demo.launch)
 if __name__ == "__main__":
     uvicorn.run(custom_app, host="0.0.0.0", port=7860)
-demo.queue().launch(server_name="0.0.0.0", server_port=7860, allowed_paths=[DATA_DIR])
