@@ -78,12 +78,10 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
     try:
         from faster_whisper import WhisperModel
         
-        db_update_status(task_id, "⏳ Загрузка модели...")
-        # Ускоряем декодирование на CPU с использованием 4 потоков
+        db_update_status(task_id, f"⏳ Загрузка модели ({model_size})...")
         model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=4)
         
         db_update_status(task_id, "⏳ Расшифровка 0%")
-        # beam_size=1 дает 4-кратный прирост скорости на CPU при сохранении качества
         segments, info = model.transcribe(file_path, language="ru", beam_size=1)
         
         duration = info.duration
@@ -114,7 +112,7 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         conn.commit()
         conn.close()
         
-        send_file_to_tg(user_id, res_path, f"Готово: {original_name}")
+        send_file_to_tg(user_id, res_path, f"Готово ({model_size}): {original_name}")
 
     except Exception as e:
         import traceback
@@ -129,7 +127,7 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
     try:
         from faster_whisper import WhisperModel
         
-        db_update_status(task_id, "⏳ Загрузка модели...")
+        db_update_status(task_id, f"⏳ Загрузка модели ({model_size})...")
         model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=4)
         doc = Document()
         doc.add_paragraph(f"Сводный отчет (Файлов: {len(file_list)})")
@@ -204,7 +202,7 @@ def recover_pending_tasks():
                     "user_id": user_id,
                     "file_path": matched_file,
                     "original_name": original_name,
-                    "model_size": "small",
+                    "model_size": "medium",
                     "task_id": task_id
                 })
             else:
@@ -225,7 +223,7 @@ def worker_loop():
             task_type = task_info.get("type")
             user_id = task_info.get("user_id")
             task_id = task_info.get("task_id")
-            model_size = task_info.get("model_size")
+            model_size = task_info.get("model_size", "medium")
             
             if task_type == "single":
                 file_path = task_info.get("file_path")
@@ -267,6 +265,65 @@ def handle_start(message):
             bot.reply_to(message, "✅ Авторизовано! Вернитесь на сайт.")
     except Exception as e:
         print(f"Error in handle_start: {e}")
+
+@bot.message_handler(content_types=['audio', 'voice', 'video', 'document'])
+def handle_incoming_file(message):
+    try:
+        user_id = str(message.chat.id)
+        file_info = None
+        file_name = "audio_file"
+
+        if message.audio:
+            file_info = bot.get_file(message.audio.file_id)
+            file_name = message.audio.file_name or f"audio_{int(time.time())}.mp3"
+        elif message.voice:
+            file_info = bot.get_file(message.voice.file_id)
+            file_name = f"voice_{int(time.time())}.ogg"
+        elif message.video:
+            file_info = bot.get_file(message.video.file_id)
+            file_name = message.video.file_name or f"video_{int(time.time())}.mp4"
+        elif message.document:
+            file_info = bot.get_file(message.document.file_id)
+            file_name = message.document.file_name or f"file_{int(time.time())}"
+
+        if not file_info:
+            bot.reply_to(message, "⚠️ Не удалось получить информацию о файле.")
+            return
+
+        bot.reply_to(message, f"📥 Файл «{file_name}» получен! Добавлен в очередь на транскрибацию (модель: medium)...")
+
+        downloaded_bytes = bot.download_file(file_info.file_path)
+        safe_name = f"{int(time.time())}_{uuid.uuid4().hex[:4]}_{file_name}"
+        saved_path = os.path.join(FILES_DIR, safe_name)
+
+        with open(saved_path, 'wb') as new_file:
+            new_file.write(downloaded_bytes)
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO tasks (user_id, filename, status, created_at) VALUES (?, ?, ?, ?)",
+                       (user_id, file_name, "Очередь", datetime.now().strftime("%Y-%m-%d %H:%M")))
+        task_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        task_queue.put({
+            "type": "single",
+            "user_id": user_id,
+            "file_path": saved_path,
+            "original_name": file_name,
+            "model_size": "medium",
+            "task_id": task_id
+        })
+
+    except Exception as e:
+        import traceback
+        print(f"Error in handle_incoming_file: {e}")
+        traceback.print_exc()
+        if "too big" in str(e).lower() or "file is too big" in str(e).lower():
+            bot.reply_to(message, "⚠️ Файл слишком большой для скачивания через Telegram API (лимит 20 МБ). Загрузите его через сайт whisper.chernienko.pro!")
+        else:
+            bot.reply_to(message, f"❌ Ошибка при приеме файла: {str(e)[:50]}")
 
 try:
     print("Clearing active webhooks to resolve 409 Conflict...")
@@ -460,7 +517,7 @@ with gr.Blocks(title="Whisper Pro") as demo:
         with gr.Tabs():
             with gr.Tab("Загрузка"):
                 file_in = gr.File(file_count="multiple", label="Аудио/Видео", file_types=["audio", "video", ".webm"])
-                model_in = gr.Dropdown(["small", "medium"], value="small", label="Модель")
+                model_in = gr.Dropdown(["small", "medium"], value="medium", label="Модель")
                 merge_in = gr.Checkbox(label="Объединить в один файл", value=False)
                 run_btn = gr.Button("🚀 Начать транскрибацию", variant="primary")
                 run_out = gr.Textbox(label="Результат")
@@ -552,7 +609,7 @@ async def api_asr(audio_file: UploadFile = File(...)):
     
     try:
         from faster_whisper import WhisperModel
-        model = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=4)
+        model = WhisperModel("medium", device="cpu", compute_type="int8", cpu_threads=4)
         segments, info = model.transcribe(temp_path, language="ru", beam_size=1)
         text = "".join(s.text for s in segments)
         return {"text": text}
