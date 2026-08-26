@@ -10,13 +10,13 @@ import threading
 from datetime import datetime
 from docx import Document
 
-from fastapi import FastAPI, UploadFile, File, Form, Request, Response, HTTPException, Depends
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, UploadFile, File, Form, Request, Response, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse, PlainTextResponse
 import uvicorn
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- НАСТРОЙКИ ---
+# --- КОНФИГУРАЦИЯ ---
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8504609196:AAE-AXIpfytvvDigddCHMvTT9ukPp9m-SWw")
 TG_BOT_USERNAME = os.environ.get("TG_BOT_USERNAME", "whisper_log_bot")
 SITE_URL = os.environ.get("SITE_URL", "https://whisper.chernienko.pro")
@@ -34,7 +34,7 @@ os.makedirs(FILES_DIR, exist_ok=True)
 os.makedirs(AUDIO_TEMP_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(TG_BOT_TOKEN)
-app = FastAPI(title="Whisper Pro Studio")
+app = FastAPI(title="Whisper Pro Studio", version="2.0.0")
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
@@ -69,12 +69,15 @@ def db_update_status(task_id, status_str, result_path=None):
 def get_user_id_from_token(token: str):
     if not token:
         return None
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM login_sessions WHERE token = ?", (token,))
-    row = c.fetchone()
-    conn.close()
-    return str(row[0]) if row and row[0] else None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM login_sessions WHERE token = ?", (token,))
+        row = c.fetchone()
+        conn.close()
+        return str(row[0]) if row and row[0] else None
+    except Exception:
+        return None
 
 def unload_memory(obj=None):
     import gc
@@ -154,7 +157,12 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
                 db_update_status(task_id, status_str)
                 last_update = curr_time
 
-        db_update_status(task_id, "⏳ Формирование Word-документа...")
+        db_update_status(task_id, "⏳ Формирование документов...")
+        
+        # 1. Сохраняем текстовый вариант
+        txt_filename = f"Transcription_{int(time.time())}_{task_id}.txt"
+        txt_path = os.path.join(FILES_DIR, txt_filename)
+        
         doc = Document()
         if full_text:
             content_str = "\n".join(full_text)
@@ -165,8 +173,11 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
             caption = f"⚠️ Готово (речь не обнаружена): {original_name}"
             final_status = "✅ Готово (тишина)"
 
-        doc.add_paragraph(f"Файл: {original_name}\nМодель: {model_size}\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n" + content_str)
+        with open(txt_path, "w", encoding="utf-8") as tf:
+            tf.write(f"Файл: {original_name}\nМодель: {model_size}\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n" + content_str)
 
+        # 2. Сохраняем Word .docx
+        doc.add_paragraph(f"Файл: {original_name}\nМодель: {model_size}\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n" + content_str)
         res_filename = f"Transcription_{int(time.time())}_{task_id}.docx"
         res_path = os.path.join(FILES_DIR, res_filename)
         doc.save(res_path)
@@ -430,17 +441,23 @@ def handle_incoming_file(message):
 # --- FASTAPI AUTH & API ENDPOINTS ---
 
 def get_current_user_id(request: Request):
-    # 1. Check cookie
+    # 1. Cookie
     cookie_token = request.cookies.get("whisper_token")
     if cookie_token:
         uid = get_user_id_from_token(cookie_token)
         if uid:
             return uid
-    # 2. Check Authorization header
+    # 2. Header
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         bearer_token = auth_header.replace("Bearer ", "").strip()
         uid = get_user_id_from_token(bearer_token)
+        if uid:
+            return uid
+    # 3. Query param token fallback
+    query_token = request.query_params.get("token")
+    if query_token:
+        uid = get_user_id_from_token(query_token)
         if uid:
             return uid
     return None
@@ -463,14 +480,12 @@ async def login_callback(token: str):
 
 @app.get("/api/auth/token")
 async def get_auth_token():
-    """Генерирует токен авторизации и ссылку на Telegram-бота"""
     token = str(uuid.uuid4())
     tg_url = f"https://t.me/{TG_BOT_USERNAME}?start={token}"
     return {"token": token, "tg_url": tg_url, "bot_username": TG_BOT_USERNAME}
 
 @app.get("/api/auth/status")
 async def check_auth_status(token: str, response: Response):
-    """Проверяет подтверждение токена в Telegram и выставляет cookie"""
     uid = get_user_id_from_token(token)
     if uid:
         response.set_cookie(
@@ -493,17 +508,11 @@ async def logout(response: Response):
 async def get_tasks(request: Request):
     uid = get_current_user_id(request)
     if not uid:
-        # Fallback to query param token if cookie missing
-        token_param = request.query_params.get("token")
-        if token_param:
-            uid = get_user_id_from_token(token_param)
-
-    if not uid:
         raise HTTPException(status_code=401, detail="Не авторизован")
 
     conn = sqlite3.connect(DB_PATH)
     tasks = conn.execute(
-        "SELECT id, created_at, filename, status, result_path FROM tasks WHERE user_id = ? ORDER BY id DESC LIMIT 25",
+        "SELECT id, created_at, filename, status, result_path FROM tasks WHERE user_id = ? ORDER BY id DESC LIMIT 30",
         (uid,)
     ).fetchall()
     conn.close()
@@ -511,11 +520,18 @@ async def get_tasks(request: Request):
     task_list = []
     for t in tasks:
         tid, created_at, filename, status, result_path = t
-        download_url = None
-        if result_path and os.path.exists(result_path):
-            download_url = f"/download/{os.path.basename(result_path)}"
+        download_docx = None
+        download_txt = None
+        has_text = False
 
-        # Вычисляем прогресс в процентах для прогресс-бара
+        if result_path and os.path.exists(result_path):
+            basename = os.path.basename(result_path)
+            download_docx = f"/download/{basename}"
+            txt_base = basename.replace(".docx", ".txt")
+            if os.path.exists(os.path.join(FILES_DIR, txt_base)):
+                download_txt = f"/download/{txt_base}"
+                has_text = True
+
         percent = None
         match = re.search(r'(\d+)%', status)
         if match:
@@ -529,7 +545,9 @@ async def get_tasks(request: Request):
             "filename": filename,
             "status": status,
             "percent": percent,
-            "download_url": download_url
+            "download_docx": download_docx,
+            "download_txt": download_txt,
+            "has_text": has_text
         })
 
     active_task = None
@@ -542,6 +560,36 @@ async def get_tasks(request: Request):
         "tasks": task_list
     }
 
+@app.get("/api/tasks/{task_id}/text")
+async def get_task_text(task_id: int, request: Request):
+    uid = get_current_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT filename, result_path FROM tasks WHERE id = ? AND user_id = ?", (task_id, uid)).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    fname, rpath = row
+    if not rpath or not os.path.exists(rpath):
+        return {"filename": fname, "text": "Текст еще не сформирован"}
+
+    txt_path = rpath.replace(".docx", ".txt")
+    if os.path.exists(txt_path):
+        with open(txt_path, "r", encoding="utf-8") as f:
+            return {"filename": fname, "text": f.read()}
+
+    # Fallback to reading docx
+    try:
+        doc = Document(rpath)
+        full_txt = "\n".join([p.text for p in doc.paragraphs])
+        return {"filename": fname, "text": full_txt}
+    except Exception as e:
+        return {"filename": fname, "text": f"Ошибка чтения документа: {e}"}
+
 @app.post("/api/tasks/create")
 async def create_task(
     request: Request,
@@ -550,11 +598,6 @@ async def create_task(
     merge_mode: bool = Form(False)
 ):
     uid = get_current_user_id(request)
-    if not uid:
-        token_param = request.query_params.get("token")
-        if token_param:
-            uid = get_user_id_from_token(token_param)
-
     if not uid:
         raise HTTPException(status_code=401, detail="Не авторизован")
 
@@ -615,9 +658,16 @@ async def download_file(filename: str):
     file_path = os.path.join(FILES_DIR, safe_name)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Файл не найден")
+    
+    media_type = "application/octet-stream"
+    if safe_name.endswith(".docx"):
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif safe_name.endswith(".txt"):
+        media_type = "text/plain; charset=utf-8"
+
     return FileResponse(
         file_path,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        media_type=media_type,
         filename=safe_name
     )
 
@@ -656,28 +706,50 @@ async def api_asr(audio_file: UploadFile = File(...)):
             except Exception:
                 pass
 
-# --- UI HTML / CSS / JS ---
-HTML_PAGE = """<!DOCTYPE html>
+# --- PRODUCTION-GRADE WEB APP FRONTEND (HTML5 + MODERN CSS + JS) ---
+HTML_APP = """<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Whisper Pro Studio — Транскрибация</title>
+  <title>Whisper Pro Studio — Сверхточная транскрибация речи</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   <style>
+    /* DESIGN_VARIANCE: Medium | MOTION_INTENSITY: Expressive | VISUAL_DENSITY: Standard */
+    :root {
+      --bg-main: #080c14;
+      --bg-card: rgba(18, 24, 38, 0.75);
+      --bg-card-hover: rgba(28, 38, 58, 0.85);
+      --border-card: rgba(255, 255, 255, 0.08);
+      --border-accent: rgba(59, 130, 246, 0.4);
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --accent-cyan: #06b6d4;
+      --accent-emerald: #10b981;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+      --radius-lg: 18px;
+      --radius-md: 12px;
+      --radius-sm: 8px;
+      --shadow-ambient: 0 12px 36px rgba(0, 0, 0, 0.4);
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background: #0b0f19;
-      color: #f1f5f9;
-      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at 50% 0%, #172554 0%, var(--bg-main) 60%);
+      background-attachment: fixed;
+      color: var(--text-main);
+      font-family: var(--font-sans);
       min-height: 100vh;
       display: flex;
       flex-direction: column;
+      overflow-x: hidden;
     }
     .container {
-      max-width: 1050px;
+      max-width: 1080px;
       margin: 0 auto;
       padding: 24px 20px;
       width: 100%;
@@ -687,41 +759,44 @@ HTML_PAGE = """<!DOCTYPE html>
       justify-content: space-between;
       align-items: center;
       padding-bottom: 20px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-      margin-bottom: 24px;
+      border-bottom: 1px solid var(--border-card);
+      margin-bottom: 28px;
     }
     .logo-box {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 14px;
+      text-decoration: none;
     }
     .logo-icon {
-      width: 42px;
-      height: 42px;
-      background: linear-gradient(135deg, #3b82f6, #06b6d4);
-      border-radius: 12px;
+      width: 44px;
+      height: 44px;
+      background: linear-gradient(135deg, var(--primary), var(--accent-cyan));
+      border-radius: var(--radius-md);
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 22px;
-      box-shadow: 0 4px 16px rgba(59, 130, 246, 0.35);
+      font-size: 24px;
+      box-shadow: 0 4px 18px rgba(37, 99, 235, 0.4);
     }
     .logo-text h1 {
-      font-size: 20px;
+      font-size: 21px;
       font-weight: 800;
       letter-spacing: -0.5px;
-      color: #ffffff;
+      background: linear-gradient(135deg, #ffffff, #cbd5e1);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
     }
     .logo-text p {
       font-size: 12px;
-      color: #94a3b8;
+      color: var(--text-muted);
     }
     .status-badge {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      background: rgba(30, 41, 59, 0.7);
-      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid var(--border-card);
       padding: 6px 14px;
       border-radius: 30px;
       font-size: 12px;
@@ -732,25 +807,40 @@ HTML_PAGE = """<!DOCTYPE html>
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: #10b981;
-      box-shadow: 0 0 10px #10b981;
+      background: var(--accent-emerald);
+      box-shadow: 0 0 10px var(--accent-emerald);
     }
     .glass-card {
-      background: rgba(30, 41, 59, 0.6);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      border-radius: 18px;
-      padding: 24px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+      background: var(--bg-card);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--border-card);
+      border-radius: var(--radius-lg);
+      padding: 26px;
+      box-shadow: var(--shadow-ambient);
       margin-bottom: 24px;
+      transition: border-color 0.2s ease;
     }
+    .glass-card:hover {
+      border-color: rgba(255, 255, 255, 0.14);
+    }
+
     /* AUTH SCREEN */
-    .auth-container {
-      text-align: center;
-      padding: 40px 20px;
-      max-width: 540px;
+    .auth-card {
+      max-width: 520px;
       margin: 40px auto;
+      text-align: center;
+      padding: 44px 30px;
+    }
+    .auth-icon {
+      font-size: 54px;
+      margin-bottom: 16px;
+      display: inline-block;
+      animation: floatIcon 3s ease-in-out infinite;
+    }
+    @keyframes floatIcon {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-6px); }
     }
     .auth-btn {
       display: inline-flex;
@@ -760,48 +850,50 @@ HTML_PAGE = """<!DOCTYPE html>
       background: linear-gradient(135deg, #0284c7, #0369a1);
       color: #ffffff;
       padding: 16px 36px;
-      border-radius: 14px;
+      border-radius: var(--radius-md);
       text-decoration: none;
       font-weight: 700;
       font-size: 16px;
-      box-shadow: 0 6px 20px rgba(2, 132, 199, 0.4);
+      box-shadow: 0 6px 22px rgba(2, 132, 199, 0.45);
       transition: all 0.2s ease;
       cursor: pointer;
       border: none;
-      margin: 20px 0;
+      margin: 22px 0 14px 0;
+      width: 100%;
     }
     .auth-btn:hover {
       transform: translateY(-2px);
-      box-shadow: 0 8px 26px rgba(2, 132, 199, 0.6);
+      box-shadow: 0 8px 28px rgba(2, 132, 199, 0.65);
     }
     .spinner {
       display: inline-block;
       width: 18px;
       height: 18px;
-      border: 2px solid rgba(255,255,255,0.3);
+      border: 2px solid rgba(255,255,255,0.25);
       border-radius: 50%;
-      border-top-color: #ffffff;
+      border-top-color: #38bdf8;
       animation: spin 0.8s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* UPLOAD ZONE */
+    /* UPLOAD DROPZONE */
     .dropzone {
       border: 2px dashed rgba(59, 130, 246, 0.4);
-      background: rgba(15, 23, 42, 0.6);
-      border-radius: 14px;
-      padding: 36px 20px;
+      background: rgba(11, 17, 33, 0.7);
+      border-radius: var(--radius-md);
+      padding: 40px 20px;
       text-align: center;
       cursor: pointer;
-      transition: all 0.2s ease;
+      transition: all 0.25s ease;
       position: relative;
     }
     .dropzone:hover, .dropzone.dragover {
       border-color: #38bdf8;
-      background: rgba(30, 58, 138, 0.2);
+      background: rgba(30, 58, 138, 0.25);
+      transform: scale(1.005);
     }
     .dropzone-icon {
-      font-size: 42px;
+      font-size: 46px;
       margin-bottom: 12px;
       display: block;
     }
@@ -811,17 +903,21 @@ HTML_PAGE = """<!DOCTYPE html>
       opacity: 0;
       cursor: pointer;
     }
-    .file-list-preview {
+    .file-preview {
       margin-top: 14px;
-      font-size: 13px;
+      font-size: 14px;
       color: #38bdf8;
       font-weight: 600;
+      background: rgba(56, 189, 248, 0.1);
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      display: inline-block;
     }
     .controls-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      margin-top: 20px;
+      gap: 18px;
+      margin-top: 22px;
     }
     @media (max-width: 640px) {
       .controls-grid { grid-template-columns: 1fr; }
@@ -829,43 +925,47 @@ HTML_PAGE = """<!DOCTYPE html>
     .form-group label {
       display: block;
       font-size: 13px;
-      font-weight: 600;
-      color: #94a3b8;
+      font-weight: 700;
+      color: var(--text-muted);
       margin-bottom: 8px;
     }
     .select-input {
       width: 100%;
-      background: #0f172a;
+      background: #0b1120;
       border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 10px;
+      border-radius: var(--radius-sm);
       color: #ffffff;
       padding: 12px 14px;
       font-size: 14px;
-      font-weight: 500;
+      font-weight: 600;
       outline: none;
     }
-    .checkbox-label {
+    .select-input:focus {
+      border-color: var(--primary);
+    }
+    .checkbox-container {
       display: flex;
       align-items: center;
-      gap: 10px;
-      margin-top: 32px;
+      gap: 12px;
+      margin-top: 30px;
       cursor: pointer;
       font-size: 14px;
       color: #e2e8f0;
       font-weight: 600;
+      user-select: none;
     }
     .btn-submit {
       width: 100%;
-      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      background: linear-gradient(135deg, var(--primary), #1e40af);
       color: #ffffff;
       padding: 16px;
-      border-radius: 12px;
+      border-radius: var(--radius-md);
       font-size: 16px;
-      font-weight: 700;
+      font-weight: 800;
       border: none;
       cursor: pointer;
       box-shadow: 0 6px 20px rgba(37, 99, 235, 0.4);
-      margin-top: 20px;
+      margin-top: 24px;
       transition: all 0.2s ease;
       display: flex;
       align-items: center;
@@ -874,33 +974,38 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     .btn-submit:hover:not(:disabled) {
       transform: translateY(-2px);
-      box-shadow: 0 8px 24px rgba(37, 99, 235, 0.6);
+      box-shadow: 0 8px 26px rgba(37, 99, 235, 0.6);
     }
     .btn-submit:disabled {
       opacity: 0.6;
       cursor: not-allowed;
     }
 
-    /* LIVE TASK CARD */
+    /* LIVE PROGRESS CARD */
     .active-card {
-      border: 1px solid rgba(59, 130, 246, 0.4);
-      background: linear-gradient(135deg, rgba(30, 41, 59, 0.8), rgba(15, 23, 42, 0.9));
+      border: 1px solid var(--border-accent);
+      background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.95));
+      animation: pulseGlow 3s infinite alternate;
+    }
+    @keyframes pulseGlow {
+      0% { box-shadow: 0 8px 24px rgba(37, 99, 235, 0.2); }
+      100% { box-shadow: 0 8px 32px rgba(6, 182, 212, 0.35); }
     }
     .progress-bar-container {
-      background: #1e2330;
+      background: #141c2e;
       border: 1px solid #334155;
-      border-radius: 14px;
-      height: 32px;
+      border-radius: var(--radius-md);
+      height: 34px;
       overflow: hidden;
       position: relative;
       margin-top: 14px;
-      box-shadow: inset 0 2px 4px rgba(0,0,0,0.5);
+      box-shadow: inset 0 2px 5px rgba(0,0,0,0.6);
     }
     .progress-fill {
       background: linear-gradient(90deg, #2563eb, #06b6d4, #10b981);
       height: 100%;
       transition: width 0.4s ease-in-out;
-      box-shadow: 0 0 14px rgba(6, 182, 212, 0.6);
+      box-shadow: 0 0 16px rgba(6, 182, 212, 0.7);
     }
     .progress-text {
       position: absolute;
@@ -911,7 +1016,8 @@ HTML_PAGE = """<!DOCTYPE html>
       font-size: 13px;
       font-weight: 700;
       color: #ffffff;
-      text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+      text-shadow: 0 1px 4px rgba(0,0,0,0.9);
+      font-family: var(--font-mono);
     }
     .btn-dl-ready {
       display: inline-flex;
@@ -919,16 +1025,41 @@ HTML_PAGE = """<!DOCTYPE html>
       gap: 8px;
       background: linear-gradient(135deg, #10b981, #059669);
       color: #ffffff;
-      padding: 10px 20px;
-      border-radius: 10px;
+      padding: 10px 22px;
+      border-radius: var(--radius-sm);
       text-decoration: none;
       font-weight: 700;
       font-size: 14px;
-      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+      box-shadow: 0 4px 14px rgba(16, 185, 129, 0.4);
       margin-top: 14px;
     }
 
-    /* HISTORY TABLE */
+    /* TABS */
+    .tabs {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 20px;
+      border-bottom: 1px solid var(--border-card);
+      padding-bottom: 8px;
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-weight: 700;
+      font-size: 15px;
+      padding: 10px 20px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .tab-btn.active {
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border-bottom: 2px solid #60a5fa;
+    }
+
+    /* TABLE */
     .table-container {
       overflow-x: auto;
       margin-top: 14px;
@@ -941,41 +1072,122 @@ HTML_PAGE = """<!DOCTYPE html>
     th {
       text-align: left;
       padding: 12px 14px;
-      color: #94a3b8;
-      font-weight: 600;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      color: var(--text-muted);
+      font-weight: 700;
+      border-bottom: 1px solid var(--border-card);
     }
     td {
       padding: 14px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
       color: #e2e8f0;
     }
     .status-pill {
       display: inline-block;
-      padding: 4px 10px;
-      border-radius: 8px;
-      font-weight: 600;
+      padding: 5px 12px;
+      border-radius: 20px;
+      font-weight: 700;
       font-size: 12px;
     }
     .status-pill.done { background: #132e1e; color: #4ade80; border: 1px solid #166534; }
     .status-pill.working { background: #2d2616; color: #fbbf24; border: 1px solid #78350f; }
     .status-pill.error { background: #331919; color: #f87171; border: 1px solid #991b1b; }
-    .btn-table-dl {
-      display: inline-block;
-      background: #2563eb;
-      color: #ffffff;
-      padding: 5px 12px;
-      border-radius: 6px;
+    .action-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .btn-table-action {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: #1e293b;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #cbd5e1;
+      padding: 6px 12px;
+      border-radius: var(--radius-sm);
       text-decoration: none;
       font-weight: 600;
       font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-table-action:hover {
+      background: var(--primary);
+      color: #ffffff;
+      border-color: var(--primary);
+    }
+    .btn-table-primary {
+      background: #2563eb;
+      color: #ffffff;
+      border: none;
+    }
+    .btn-table-primary:hover {
+      background: #1d4ed8;
+    }
+
+    /* MODAL VIEWER */
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.8);
+      backdrop-filter: blur(8px);
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .modal-card {
+      background: #0f172a;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: var(--radius-lg);
+      max-width: 840px;
+      width: 100%;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.7);
+    }
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--border-card);
+    }
+    .modal-body {
+      padding: 24px;
+      overflow-y: auto;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.7;
+      color: #cbd5e1;
+      white-space: pre-wrap;
+      user-select: text;
+    }
+    .modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 12px;
+      padding: 16px 24px;
+      border-top: 1px solid var(--border-card);
+    }
+    .btn-secondary {
+      background: #334155;
+      color: #ffffff;
+      padding: 8px 18px;
+      border-radius: var(--radius-sm);
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
     }
     .logout-btn {
       background: transparent;
       border: 1px solid rgba(255, 255, 255, 0.15);
-      color: #94a3b8;
+      color: var(--text-muted);
       padding: 6px 14px;
-      border-radius: 8px;
+      border-radius: var(--radius-sm);
       cursor: pointer;
       font-size: 12px;
       font-weight: 600;
@@ -986,41 +1198,19 @@ HTML_PAGE = """<!DOCTYPE html>
       color: #f87171;
       border-color: #ef4444;
     }
-    .tabs {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 18px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-      padding-bottom: 8px;
-    }
-    .tab-btn {
-      background: transparent;
-      border: none;
-      color: #94a3b8;
-      font-weight: 700;
-      font-size: 14px;
-      padding: 8px 16px;
-      border-radius: 8px;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-    .tab-btn.active {
-      background: rgba(59, 130, 246, 0.15);
-      color: #60a5fa;
-    }
     .hidden { display: none !important; }
   </style>
 </head>
 <body>
   <div class="container">
     <header class="header">
-      <div class="logo-box">
+      <a href="/" class="logo-box">
         <div class="logo-icon">🎙</div>
         <div class="logo-text">
           <h1>Whisper Pro Studio</h1>
-          <p>Сверхточная транскрибация аудио и видео</p>
+          <p>Сверхточная транскрибация речи на базе нейросетей</p>
         </div>
-      </div>
+      </a>
       <div style="display:flex;align-items:center;gap:12px;">
         <div class="status-badge">
           <span class="dot"></span>
@@ -1030,32 +1220,33 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
     </header>
 
-    <!-- ЭКРАН АВТОРИЗАЦИИ -->
-    <div id="authScreen" class="glass-card auth-container">
-      <h2 style="font-size:22px;margin-bottom:8px;">👋 Авторизация</h2>
-      <p style="color:#94a3b8;font-size:14px;margin-bottom:24px;">Для доступа к расшифровкам и мгновенного получения документов в Telegram:</p>
+    <!-- 1. ЭКРАН АВТОРИЗАЦИИ ЧЕРЕЗ TELEGRAM -->
+    <div id="authScreen" class="glass-card auth-card">
+      <span class="auth-icon">🔐</span>
+      <h2 style="font-size:24px;margin-bottom:8px;font-weight:800;">Вход в Whisper Pro</h2>
+      <p style="color:#94a3b8;font-size:14px;line-height:1.5;">Авторизуйтесь через ваш Telegram-аккаунт для мгновенного доступа к транскрибациям и автоматической отправки готовых файлов в чат:</p>
       
       <div>
         <a id="tgLoginBtn" href="#" target="_blank" class="auth-btn">
-          ✈️ Войти через Telegram-бота
+          ✈️ Войти через Telegram-бота (@whisper_log_bot)
         </a>
       </div>
 
-      <div style="display:flex;align-items:center;justify-content:center;gap:8px;color:#94a3b8;font-size:13px;margin-top:12px;">
+      <div style="display:flex;align-items:center;justify-content:center;gap:10px;color:#94a3b8;font-size:13px;margin-top:14px;">
         <span class="spinner"></span>
-        <span>Ожидание подтверждения... Вход выполнится <b>автоматически</b>.</span>
+        <span>Ожидание нажатия Start в боте... Вход выполнится <b>автоматически</b>.</span>
       </div>
     </div>
 
-    <!-- ЛИЧНЫЙ КАБИНЕТ -->
+    <!-- 2. ЛИЧНЫЙ КАБИНЕТ (ПОСЛЕ ВХОДА) -->
     <div id="cabinetScreen" class="hidden">
       <!-- Активная задача (Live Card) -->
       <div id="activeTaskBox" class="glass-card active-card hidden">
         <div style="display:flex;justify-content:space-between;align-items:center;">
-          <div style="font-weight:700;font-size:15px;color:#e2e8f0;">
-            🔥 Текущая задача: <span id="activeFileName" style="color:#38bdf8;"></span>
+          <div style="font-weight:800;font-size:15px;color:#e2e8f0;">
+            🔥 В процессе: <span id="activeFileName" style="color:#38bdf8;"></span>
           </div>
-          <span id="activeTime" style="font-size:12px;color:#94a3b8;"></span>
+          <span id="activeTime" style="font-size:12px;color:#94a3b8;font-family:var(--font-mono);"></span>
         </div>
         <div class="progress-bar-container">
           <div id="progressFill" class="progress-fill" style="width:0%;"></div>
@@ -1067,17 +1258,17 @@ HTML_PAGE = """<!DOCTYPE html>
       <!-- Вкладки -->
       <div class="tabs">
         <button id="tabNewBtn" class="tab-btn active" onclick="switchTab('new')">🚀 Новая транскрибация</button>
-        <button id="tabHistoryBtn" class="tab-btn" onclick="switchTab('history')">📜 История и файлы (<span id="taskCount">0</span>)</button>
+        <button id="tabHistoryBtn" class="tab-btn" onclick="switchTab('history')">📜 Мои расшифровки (<span id="taskCount">0</span>)</button>
       </div>
 
       <!-- Вкладка: Загрузка -->
       <div id="tabNew" class="glass-card">
         <div class="dropzone" id="dropzone">
           <span class="dropzone-icon">📁</span>
-          <h3 style="font-size:16px;font-weight:700;margin-bottom:4px;">Перетащите файлы сюда или нажмите для выбора</h3>
-          <p style="font-size:12px;color:#94a3b8;">MP4, WEBM, MP3, OGG, WAV, M4A, MOV, MKV (до 2 ГБ)</p>
+          <h3 style="font-size:17px;font-weight:800;margin-bottom:4px;">Перетащите аудио или видео файлы сюда</h3>
+          <p style="font-size:13px;color:#94a3b8;">Поддерживаются: MP4, WEBM, MP3, OGG, WAV, M4A, MOV, MKV до 2 ГБ</p>
           <input type="file" id="fileInput" class="file-input" multiple accept="audio/*,video/*,.webm,.mp4,.ogg,.mp3,.wav,.m4a,.mov,.mkv">
-          <div id="filePreview" class="file-list-preview hidden"></div>
+          <div id="filePreview" class="file-preview hidden"></div>
         </div>
 
         <div class="controls-grid">
@@ -1085,11 +1276,11 @@ HTML_PAGE = """<!DOCTYPE html>
             <label>🧠 Модель нейросети</label>
             <select id="modelSelect" class="select-input">
               <option value="medium" selected>medium (Максимальная точность — рекомендуется)</option>
-              <option value="small">small (Быстрая обработка)</option>
+              <option value="small">small (Быстрая обработка коротких заметок)</option>
             </select>
           </div>
           <div class="form-group">
-            <label class="checkbox-label">
+            <label class="checkbox-container">
               <input type="checkbox" id="mergeCheckbox" style="width:18px;height:18px;">
               <span>📑 Объединить файлы в один общий .docx отчет</span>
             </label>
@@ -1100,13 +1291,13 @@ HTML_PAGE = """<!DOCTYPE html>
           <span>🚀 Запустить транскрибацию</span>
         </button>
 
-        <div id="uploadStatusText" style="text-align:center;margin-top:14px;font-size:13px;color:#38bdf8;font-weight:600;"></div>
+        <div id="uploadStatusText" style="text-align:center;margin-top:14px;font-size:13px;color:#38bdf8;font-weight:700;"></div>
       </div>
 
       <!-- Вкладка: История -->
       <div id="tabHistory" class="glass-card hidden">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-          <h3 style="font-size:16px;font-weight:700;">📜 Ваши расшифровки</h3>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+          <h3 style="font-size:17px;font-weight:800;">📜 История расшифровок</h3>
           <button class="logout-btn" onclick="fetchTasks()">🔄 Обновить</button>
         </div>
         <div class="table-container">
@@ -1116,11 +1307,11 @@ HTML_PAGE = """<!DOCTYPE html>
                 <th>Дата</th>
                 <th>Файл</th>
                 <th>Статус</th>
-                <th>Документ</th>
+                <th>Действия</th>
               </tr>
             </thead>
             <tbody id="historyTableBody">
-              <tr><td colspan="4" style="text-align:center;color:#64748b;">Загрузка истории...</td></tr>
+              <tr><td colspan="4" style="text-align:center;color:#64748b;padding:24px;">Загрузка истории...</td></tr>
             </tbody>
           </table>
         </div>
@@ -1129,14 +1320,28 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- МОДАЛЬНОЕ ОКНО ПРОСМОТРА ТЕКСТА -->
+  <div id="textModal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modalTitle" style="font-size:16px;font-weight:700;color:#ffffff;">Текст расшифровки</h3>
+        <button class="btn-secondary" onclick="closeModal()">✕</button>
+      </div>
+      <div id="modalContent" class="modal-body"></div>
+      <div class="modal-footer">
+        <button class="btn-table-action" onclick="copyModalText()">📋 Копировать текст</button>
+        <button class="btn-secondary" onclick="closeModal()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let currentAuthToken = localStorage.getItem('whisper_session_token') || '';
     let pollAuthTimer = null;
     let pollTasksTimer = null;
 
-    // Инициализация
     window.addEventListener('DOMContentLoaded', async () => {
-      // Проверяем параметр ?token= в URL (если пришли из Telegram)
+      // 1. Проверяем URL параметр ?token=
       const urlParams = new URLSearchParams(window.location.search);
       const urlToken = urlParams.get('token');
       if (urlToken) {
@@ -1145,11 +1350,12 @@ HTML_PAGE = """<!DOCTYPE html>
         window.history.replaceState({}, document.title, window.location.pathname);
       }
 
-      await checkInitialAuth();
+      await initAuthFlow();
       setupDropzone();
     });
 
-    async function checkInitialAuth() {
+    async function initAuthFlow() {
+      // Попробуем запросить задачи напрямую (если есть куки)
       try {
         const res = await fetch('/api/tasks');
         if (res.ok) {
@@ -1160,7 +1366,7 @@ HTML_PAGE = """<!DOCTYPE html>
         }
       } catch (e) {}
 
-      // Если есть сохраненный токен в localStorage, проверим его статус
+      // Если в localStorage сохранен токен, проверим его статус
       if (currentAuthToken) {
         try {
           const res = await fetch(`/api/auth/status?token=${currentAuthToken}`);
@@ -1176,7 +1382,7 @@ HTML_PAGE = """<!DOCTYPE html>
         } catch (e) {}
       }
 
-      // Показываем экран логина
+      // Не авторизован -> показываем экран логина
       showLoginScreen();
     }
 
@@ -1187,14 +1393,13 @@ HTML_PAGE = """<!DOCTYPE html>
 
       if (pollTasksTimer) clearInterval(pollTasksTimer);
 
-      // Получаем новый токен и ссылку
       try {
         const res = await fetch('/api/auth/token');
         const data = await res.json();
         currentAuthToken = data.token;
         document.getElementById('tgLoginBtn').href = data.tg_url;
 
-        // Запускаем фоновый опрос подтверждения
+        // Поллинг подтверждения
         if (pollAuthTimer) clearInterval(pollAuthTimer);
         pollAuthTimer = setInterval(async () => {
           try {
@@ -1246,18 +1451,23 @@ HTML_PAGE = """<!DOCTYPE html>
       fill.style.width = Math.min(100, Math.max(5, p)) + '%';
 
       const dlBox = document.getElementById('activeDlBox');
-      if (task.download_url) {
-        dlBox.innerHTML = `<a href="${task.download_url}" download class="btn-dl-ready">📥 Скачать готовый DOCX</a>`;
+      if (task.download_docx) {
+        dlBox.innerHTML = `
+          <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px;">
+            <button class="btn-table-action" onclick="viewTaskText(${task.id})">👁 Просмотреть текст</button>
+            <a href="${task.download_docx}" download class="btn-dl-ready">📥 Скачать DOCX</a>
+          </div>
+        `;
       } else {
         dlBox.innerHTML = '';
       }
     }
 
     function updateHistoryTable(tasks) {
-      document.getElementById('taskCount').textContent = tasks.length;
+      document.getElementById('taskCount').textContent = tasks ? tasks.length : 0;
       const tbody = document.getElementById('historyTableBody');
       if (!tasks || tasks.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#64748b;">Нет созданных задач</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#64748b;padding:24px;">Нет созданных задач</td></tr>';
         return;
       }
 
@@ -1266,15 +1476,24 @@ HTML_PAGE = """<!DOCTYPE html>
         if (t.status.includes('✅') || t.status.includes('Готово')) pillClass = 'done';
         else if (t.status.includes('❌') || t.status.includes('Ошибка')) pillClass = 'error';
 
-        let linkHtml = t.download_url 
-          ? `<a href="${t.download_url}" download class="btn-table-dl">📥 Скачать .docx</a>`
-          : '<span style="color:#64748b;">—</span>';
+        let actions = '';
+        if (t.download_docx) {
+          actions = `
+            <div class="action-group">
+              <button class="btn-table-action" onclick="viewTaskText(${t.id})">👁 Текст</button>
+              <a href="${t.download_docx}" download class="btn-table-action btn-table-primary">📥 DOCX</a>
+              ${t.download_txt ? `<a href="${t.download_txt}" download class="btn-table-action">📄 TXT</a>` : ''}
+            </div>
+          `;
+        } else {
+          actions = '<span style="color:#64748b;">—</span>';
+        }
 
         return `<tr>
-          <td>${t.created_at}</td>
-          <td style="font-weight:600;">${t.filename}</td>
+          <td style="color:#94a3b8;font-family:var(--font-mono);font-size:12px;">${t.created_at}</td>
+          <td style="font-weight:700;color:#ffffff;">${t.filename}</td>
           <td><span class="status-pill ${pillClass}">${t.status}</span></td>
-          <td>${linkHtml}</td>
+          <td>${actions}</td>
         </tr>`;
       }).join('');
     }
@@ -1362,7 +1581,7 @@ HTML_PAGE = """<!DOCTYPE html>
       xhr.onload = async () => {
         submitBtn.disabled = false;
         if (xhr.status === 200) {
-          statusText.textContent = '🚀 Успешно отправлено в обработку! Результат придёт в Telegram и появится ниже.';
+          statusText.textContent = '🚀 Успешно отправлено в обработку! Результат появится ниже и придёт в Telegram.';
           fileInput.value = '';
           document.getElementById('filePreview').classList.add('hidden');
           await fetchTasks();
@@ -1380,6 +1599,31 @@ HTML_PAGE = """<!DOCTYPE html>
       xhr.send(formData);
     }
 
+    async function viewTaskText(taskId) {
+      try {
+        const res = await fetch(`/api/tasks/${taskId}/text`);
+        if (res.ok) {
+          const data = await res.json();
+          document.getElementById('modalTitle').textContent = `Текст: ${data.filename}`;
+          document.getElementById('modalContent').textContent = data.text;
+          document.getElementById('textModal').classList.remove('hidden');
+        }
+      } catch(e) {
+        alert('Ошибка при получении текста: ' + e);
+      }
+    }
+
+    function closeModal() {
+      document.getElementById('textModal').classList.add('hidden');
+    }
+
+    function copyModalText() {
+      const txt = document.getElementById('modalContent').textContent;
+      navigator.clipboard.writeText(txt).then(() => {
+        alert('Текст скопирован в буфер обмена!');
+      });
+    }
+
     async function handleLogout() {
       localStorage.removeItem('whisper_session_token');
       try {
@@ -1394,7 +1638,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index(request: Request):
-    return HTMLResponse(content=HTML_PAGE)
+    return HTMLResponse(content=HTML_APP)
 
 def start_background_services():
     if getattr(start_background_services, "_started", False):

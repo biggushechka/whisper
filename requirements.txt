@@ -1,5 +1,6 @@
-gradio
 faster-whisper
+fastapi
+uvicorn
 python-docx
 requests
 pyTelegramBotAPI
