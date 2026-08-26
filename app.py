@@ -1,20 +1,20 @@
-import gradio as gr
 import os
 import time
-import threading
-import queue
-import sqlite3
 import uuid
-import telebot
+import queue
 import shutil
+import sqlite3
 import re
 import subprocess
+import threading
 from datetime import datetime
 from docx import Document
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+
+from fastapi import FastAPI, UploadFile, File, Form, Request, Response, HTTPException, Depends
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 import uvicorn
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- НАСТРОЙКИ ---
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8504609196:AAE-AXIpfytvvDigddCHMvTT9ukPp9m-SWw")
@@ -34,6 +34,7 @@ os.makedirs(FILES_DIR, exist_ok=True)
 os.makedirs(AUDIO_TEMP_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(TG_BOT_TOKEN)
+app = FastAPI(title="Whisper Pro Studio")
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
@@ -65,6 +66,16 @@ def db_update_status(task_id, status_str, result_path=None):
     except Exception as e:
         print(f"Error updating task status: {e}")
 
+def get_user_id_from_token(token: str):
+    if not token:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM login_sessions WHERE token = ?", (token,))
+    row = c.fetchone()
+    conn.close()
+    return str(row[0]) if row and row[0] else None
+
 def unload_memory(obj=None):
     import gc
     if obj:
@@ -81,7 +92,7 @@ def send_file_to_tg(user_id, filepath, caption):
 
 def extract_audio(input_file_path):
     """
-    Мгновенно извлекает аудиодорожку через ffmpeg в 16kHz mono WAV для Whisper.
+    Мгновенно извлекает звук через ffmpeg в 16kHz mono WAV для Whisper.
     """
     base_name = os.path.splitext(os.path.basename(input_file_path))[0]
     out_wav = os.path.join(AUDIO_TEMP_DIR, f"{base_name}_{uuid.uuid4().hex[:6]}.wav")
@@ -324,7 +335,7 @@ def handle_start(message):
     try:
         args = message.text.split()
         if len(args) > 1:
-            login_token = args[1]
+            login_token = args[1].strip()
             user_id = str(message.chat.id)
             conn = sqlite3.connect(DB_PATH)
             conn.execute("INSERT OR REPLACE INTO login_sessions (token, user_id, created_at) VALUES (?, ?, ?)",
@@ -332,20 +343,20 @@ def handle_start(message):
             conn.commit()
             conn.close()
             
-            cabinet_url = f"{SITE_URL}/?token={login_token}"
+            callback_url = f"{SITE_URL}/login/callback?token={login_token}"
             markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🚀 Открыть личный кабинет", url=cabinet_url))
+            markup.add(InlineKeyboardButton("🚀 Открыть личный кабинет", url=callback_url))
             bot.reply_to(
                 message,
                 "✅ **Вход успешно подтверждён!**\n\n"
-                "Ваш браузер уже перешёл в личный кабинет. Вы также можете нажать кнопку ниже, чтобы открыть кабинет на любом устройстве:",
+                "Ваш браузер уже переходит в личный кабинет. Вы также можете открыть его по кнопке ниже:",
                 reply_markup=markup,
                 parse_mode="Markdown"
             )
         else:
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🌐 Открыть сайт Whisper Pro", url=SITE_URL))
-            bot.reply_to(message, f"👋 Привет! Отправьте мне аудио или голосовое сообщение (до 20 МБ), либо перейдите на сайт {SITE_URL} для файлов любого размера (до 2 ГБ).", reply_markup=markup)
+            bot.reply_to(message, f"👋 Привет! Отправьте мне аудио или видео файл (до 20 МБ), либо перейдите на сайт {SITE_URL} для файлов любого размера (до 2 ГБ).", reply_markup=markup)
     except Exception as e:
         print(f"Error in handle_start: {e}")
 
@@ -373,7 +384,7 @@ def handle_incoming_file(message):
             bot.reply_to(message, "⚠️ Не удалось получить информацию о файле.")
             return
 
-        bot.reply_to(message, f"📥 Файл «{file_name}» получен! Добавлен в очередь на транскрибацию (модель: medium)...")
+        bot.reply_to(message, f"📥 Файл «{file_name}» получен! Добавлен в очередь на транскрибацию...")
 
         downloaded_bytes = bot.download_file(file_info.file_path)
         safe_name = f"{int(time.time())}_{uuid.uuid4().hex[:4]}_{file_name}"
@@ -409,50 +420,168 @@ def handle_incoming_file(message):
             bot.reply_to(
                 message,
                 "⚠️ **Файл превышает лимит Telegram (20 МБ)**\n\n"
-                f"Telegram ограничивает прямую отправку боту файлами до 20 МБ. Загрузите файл через наш сайт {SITE_URL} — там поддерживаются любые файлы до 2 ГБ, а готовый .docx отчёт сразу придёт сюда в Telegram!",
+                f"Загрузите файл через наш сайт {SITE_URL} — там поддерживаются любые файлы до 2 ГБ, а готовый .docx отчёт сразу придёт сюда в Telegram!",
                 reply_markup=markup,
                 parse_mode="Markdown"
             )
         else:
             bot.reply_to(message, f"❌ Ошибка при приеме файла: {str(e)[:50]}")
 
-def check_login_status(token):
-    if not token: return None
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM login_sessions WHERE token=?", (token,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else None
+# --- FASTAPI AUTH & API ENDPOINTS ---
 
-# --- ХЕЛПЕРЫ И СТАТУСЫ ---
-def add_task(user_id, files, model_size, merge_mode):
-    if not user_id:
-        return "❌ Ошибка: Вы не авторизованы. Войдите через Telegram."
+def get_current_user_id(request: Request):
+    # 1. Check cookie
+    cookie_token = request.cookies.get("whisper_token")
+    if cookie_token:
+        uid = get_user_id_from_token(cookie_token)
+        if uid:
+            return uid
+    # 2. Check Authorization header
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        bearer_token = auth_header.replace("Bearer ", "").strip()
+        uid = get_user_id_from_token(bearer_token)
+        if uid:
+            return uid
+    return None
+
+@app.get("/login/callback")
+async def login_callback(token: str):
+    """Прямой редирект из Telegram: ставит cookie на 30 дней и перенаправляет в кабинет"""
+    uid = get_user_id_from_token(token)
+    response = RedirectResponse(url="/", status_code=302)
+    if uid:
+        response.set_cookie(
+            key="whisper_token",
+            value=token,
+            max_age=30 * 86400,
+            path="/",
+            httponly=False,
+            samesite="lax"
+        )
+    return response
+
+@app.get("/api/auth/token")
+async def get_auth_token():
+    """Генерирует токен авторизации и ссылку на Telegram-бота"""
+    token = str(uuid.uuid4())
+    tg_url = f"https://t.me/{TG_BOT_USERNAME}?start={token}"
+    return {"token": token, "tg_url": tg_url, "bot_username": TG_BOT_USERNAME}
+
+@app.get("/api/auth/status")
+async def check_auth_status(token: str, response: Response):
+    """Проверяет подтверждение токена в Telegram и выставляет cookie"""
+    uid = get_user_id_from_token(token)
+    if uid:
+        response.set_cookie(
+            key="whisper_token",
+            value=token,
+            max_age=30 * 86400,
+            path="/",
+            httponly=False,
+            samesite="lax"
+        )
+        return {"authenticated": True, "user_id": uid, "token": token}
+    return {"authenticated": False}
+
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie("whisper_token", path="/")
+    return {"status": "ok"}
+
+@app.get("/api/tasks")
+async def get_tasks(request: Request):
+    uid = get_current_user_id(request)
+    if not uid:
+        # Fallback to query param token if cookie missing
+        token_param = request.query_params.get("token")
+        if token_param:
+            uid = get_user_id_from_token(token_param)
+
+    if not uid:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+
+    conn = sqlite3.connect(DB_PATH)
+    tasks = conn.execute(
+        "SELECT id, created_at, filename, status, result_path FROM tasks WHERE user_id = ? ORDER BY id DESC LIMIT 25",
+        (uid,)
+    ).fetchall()
+    conn.close()
+
+    task_list = []
+    for t in tasks:
+        tid, created_at, filename, status, result_path = t
+        download_url = None
+        if result_path and os.path.exists(result_path):
+            download_url = f"/download/{os.path.basename(result_path)}"
+
+        # Вычисляем прогресс в процентах для прогресс-бара
+        percent = None
+        match = re.search(r'(\d+)%', status)
+        if match:
+            percent = int(match.group(1))
+        elif "✅" in status or "Готово" in status:
+            percent = 100
+
+        task_list.append({
+            "id": tid,
+            "created_at": created_at,
+            "filename": filename,
+            "status": status,
+            "percent": percent,
+            "download_url": download_url
+        })
+
+    active_task = None
+    if task_list and ("⏳" in task_list[0]["status"] or "Очередь" in task_list[0]["status"]):
+        active_task = task_list[0]
+
+    return {
+        "user_id": uid,
+        "active_task": active_task,
+        "tasks": task_list
+    }
+
+@app.post("/api/tasks/create")
+async def create_task(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    model_size: str = Form("medium"),
+    merge_mode: bool = Form(False)
+):
+    uid = get_current_user_id(request)
+    if not uid:
+        token_param = request.query_params.get("token")
+        if token_param:
+            uid = get_user_id_from_token(token_param)
+
+    if not uid:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+
     if not files or len(files) == 0:
-        return "⚠️ Выберите один или несколько аудио/видео файлов перед отправкой."
+        raise HTTPException(status_code=400, detail="Файлы не выбраны")
 
     saved_files = []
     for f in files:
-        f_path = f.name if hasattr(f, 'name') else f
-        safe_name = f"{int(time.time())}_{uuid.uuid4().hex[:4]}_{os.path.basename(f_path)}"
+        safe_name = f"{int(time.time())}_{uuid.uuid4().hex[:4]}_{os.path.basename(f.filename)}"
         saved_path = os.path.join(FILES_DIR, safe_name)
-        shutil.copy(f_path, saved_path)
-        saved_files.append((saved_path, os.path.basename(f_path)))
+        with open(saved_path, "wb") as buffer:
+            shutil.copyfileobj(f.file, buffer)
+        saved_files.append((saved_path, f.filename))
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     if merge_mode and len(saved_files) > 1:
         cursor.execute("INSERT INTO tasks (user_id, filename, status, created_at) VALUES (?, ?, ?, ?)",
-                       (user_id, f"ПАКЕТ ({len(saved_files)} файлов)", "Очередь", datetime.now().strftime("%Y-%m-%d %H:%M")))
+                       (uid, f"ПАКЕТ ({len(saved_files)} файлов)", "Очередь", datetime.now().strftime("%Y-%m-%d %H:%M")))
         task_id = cursor.lastrowid
         conn.commit()
         conn.close()
 
         task_queue.put({
             "type": "batch",
-            "user_id": user_id,
+            "user_id": uid,
             "file_list": saved_files,
             "model_size": model_size,
             "task_id": task_id
@@ -464,321 +593,23 @@ def add_task(user_id, files, model_size, merge_mode):
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute("INSERT INTO tasks (user_id, filename, status, created_at) VALUES (?, ?, ?, ?)",
-                           (user_id, name, "Очередь", datetime.now().strftime("%Y-%m-%d %H:%M")))
+                           (uid, name, "Очередь", datetime.now().strftime("%Y-%m-%d %H:%M")))
             task_id = cursor.lastrowid
             conn.commit()
             conn.close()
 
             task_queue.put({
                 "type": "single",
-                "user_id": user_id,
+                "user_id": uid,
                 "file_path": path,
                 "original_name": name,
                 "model_size": model_size,
                 "task_id": task_id
             })
 
-    return f"🚀 Добавлено в обработку ({len(saved_files)} шт.)! Вы можете закрыть страницу — результат придёт в Telegram."
+    return {"status": "ok", "count": len(saved_files)}
 
-def format_status_progress_bar(status_text):
-    if not status_text:
-        return ""
-
-    match = re.search(r'(\d+)%', status_text)
-    if match and ("Расшифрован" in status_text or "Файл" in status_text or "%" in status_text):
-        percent = int(match.group(1))
-        percent = max(0, min(100, percent))
-        return f'''
-        <div style="background:#1e2330;border:1px solid #2d3748;border-radius:12px;width:100%;min-width:220px;height:28px;overflow:hidden;position:relative;box-shadow:inset 0 2px 4px rgba(0,0,0,0.5);">
-          <div style="background:linear-gradient(90deg, #3b82f6, #06b6d4, #10b981);width:{percent}%;height:100%;transition:width 0.4s ease-in-out;box-shadow:0 0 12px rgba(6,182,212,0.5);"></div>
-          <span style="position:absolute;top:0;left:0;width:100%;height:100%;text-align:center;line-height:28px;font-size:12px;font-weight:700;color:#ffffff;text-shadow:0 1px 3px rgba(0,0,0,0.9);">{status_text}</span>
-        </div>
-        '''
-    elif "Очередь" in status_text or "Извлечение" in status_text or "Инициализация" in status_text:
-        return f'''
-        <div style="background:#2d2616;border:1px solid #78350f;border-radius:12px;width:100%;min-width:220px;height:28px;line-height:28px;text-align:center;font-size:12px;font-weight:700;color:#fbbf24;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
-          {status_text}
-        </div>
-        '''
-    elif "✅" in status_text or "Готово" in status_text:
-        return f'''
-        <div style="background:#132e1e;border:1px solid #166534;border-radius:12px;width:100%;min-width:220px;height:28px;line-height:28px;text-align:center;font-size:12px;font-weight:700;color:#4ade80;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
-          {status_text}
-        </div>
-        '''
-    elif "❌" in status_text or "Ошибка" in status_text or "Прервано" in status_text:
-        return f'''
-        <div style="background:#331919;border:1px solid #991b1b;border-radius:12px;width:100%;min-width:220px;height:28px;line-height:28px;text-align:center;font-size:12px;font-weight:700;color:#f87171;box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);">
-          {status_text}
-        </div>
-        '''
-    else:
-        return f'''
-        <div style="background:#1e2330;border:1px solid #2d3748;border-radius:12px;width:100%;min-width:220px;height:28px;line-height:28px;text-align:center;font-size:12px;font-weight:700;color:#cbd5e1;">
-          {status_text}
-        </div>
-        '''
-
-def get_history(user_id):
-    if not user_id: return []
-    conn = sqlite3.connect(DB_PATH)
-    tasks = conn.execute("SELECT created_at, filename, status, result_path FROM tasks WHERE user_id = ? ORDER BY id DESC LIMIT 20", (user_id,)).fetchall()
-    conn.close()
-
-    formatted = []
-    for t in tasks:
-        date_str = t[0]
-        fname = t[1]
-        raw_status = t[2]
-        rpath = t[3]
-
-        status_html = format_status_progress_bar(raw_status)
-
-        if rpath and os.path.exists(rpath):
-            basename = os.path.basename(rpath)
-            download_url = f"/download/{basename}"
-            file_link = f'<a href="{download_url}" target="_blank" download style="display:inline-block;background:#2563eb;color:#ffffff;font-size:12px;font-weight:600;padding:5px 12px;border-radius:8px;text-decoration:none;box-shadow:0 2px 4px rgba(0,0,0,0.2);">📥 Скачать .docx</a>'
-        else:
-            file_link = '<span style="color:#64748b;">—</span>'
-
-        formatted.append([date_str, fname, status_html, file_link])
-
-    return formatted
-
-def get_active_task_progress(user_id):
-    if not user_id:
-        return ""
-    conn = sqlite3.connect(DB_PATH)
-    task = conn.execute("SELECT id, filename, status, result_path, created_at FROM tasks WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
-    conn.close()
-
-    if not task:
-        return ""
-
-    task_id, fname, raw_status, rpath, created_at = task
-    bar_html = format_status_progress_bar(raw_status)
-
-    download_button_html = ""
-    if rpath and os.path.exists(rpath):
-        basename = os.path.basename(rpath)
-        download_button_html = f'''
-        <div style="margin-top:10px;text-align:right;">
-          <a href="/download/{basename}" target="_blank" download style="display:inline-block;background:linear-gradient(135deg, #10b981, #059669);color:#ffffff;font-weight:700;font-size:13px;padding:8px 16px;border-radius:8px;text-decoration:none;box-shadow:0 3px 6px rgba(0,0,0,0.3);">📥 Скачать готовый DOCX</a>
-        </div>
-        '''
-
-    return f'''
-    <div style="background:rgba(30, 41, 59, 0.7);border:1px solid rgba(59, 130, 246, 0.3);backdrop-filter:blur(10px);border-radius:14px;padding:16px;margin-bottom:16px;box-shadow:0 8px 24px rgba(0,0,0,0.35);">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <div style="font-size:14px;font-weight:700;color:#e2e8f0;display:flex;align-items:center;gap:6px;">
-          <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#38bdf8;box-shadow:0 0 8px #38bdf8;"></span>
-          Текущая задача: <span style="color:#60a5fa;">{fname}</span>
-        </div>
-        <span style="font-size:12px;color:#94a3b8;">{created_at}</span>
-      </div>
-      {bar_html}
-      {download_button_html}
-    </div>
-    '''
-
-def build_login_html(token):
-    link = f"https://t.me/{TG_BOT_USERNAME}?start={token}"
-    return f'''
-    <div style="text-align:center;padding:30px 10px;">
-      <a href="{link}" target="_blank" style="background:linear-gradient(135deg, #2481cc, #0088cc);color:white;padding:16px 32px;text-decoration:none;border-radius:14px;font-weight:700;font-size:16px;display:inline-flex;align-items:center;gap:10px;box-shadow:0 6px 18px rgba(36,129,204,0.4);">
-        ✈️ Войти через Telegram-бота (@{TG_BOT_USERNAME})
-      </a>
-      <p style="color:#94a3b8;font-size:13px;margin-top:14px;">Нажмите кнопку, нажмите «Start» в боте. Вход выполнится <b>автоматически</b>.</p>
-    </div>
-    '''
-
-# --- GRADIO ИНТЕРФЕЙС ---
-custom_css = """
-body {
-    background-color: #0b0f19 !important;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
-}
-.gradio-container {
-    max-width: 1000px !important;
-    margin: auto !important;
-    padding-top: 20px !important;
-}
-.header-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    background: rgba(30, 41, 59, 0.8);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    padding: 6px 14px;
-    border-radius: 20px;
-    font-size: 13px;
-    color: #94a3b8;
-    margin-bottom: 12px;
-}
-.status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #10b981;
-    box-shadow: 0 0 8px #10b981;
-}
-.btn-primary {
-    background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
-    border: none !important;
-    color: white !important;
-    font-weight: 700 !important;
-    font-size: 15px !important;
-    border-radius: 10px !important;
-    box-shadow: 0 4px 14px rgba(37, 99, 235, 0.4) !important;
-    transition: all 0.2s ease-in-out !important;
-}
-.btn-primary:hover {
-    transform: translateY(-1px) !important;
-    box-shadow: 0 6px 20px rgba(37, 99, 235, 0.6) !important;
-}
-"""
-
-with gr.Blocks(title="Whisper Pro — Студия транскрибации", css=custom_css) as demo:
-    user_id_state = gr.State("")
-    session_token = gr.State("")
-
-    with gr.Row():
-        gr.HTML("""
-        <div style="display:flex;justify-content:space-between;align-items:center;width:100%;margin-bottom:15px;">
-          <div>
-            <h1 style="font-size:24px;font-weight:800;color:#f8fafc;margin:0 0 4px 0;">🎙 Whisper Pro Studio</h1>
-            <p style="font-size:13px;color:#94a3b8;margin:0;">Сверхточная транскрибация аудио и видео с автоматической отправкой в Telegram</p>
-          </div>
-          <div class="header-badge">
-            <span class="status-dot"></span>
-            <span>Сервис онлайн</span>
-          </div>
-        </div>
-        """)
-
-    with gr.Group(visible=True) as login_screen:
-        gr.Markdown("### 👋 Авторизация")
-        gr.Markdown("Для доступа к системе и автоматической отправки расшифровок в ваш Telegram:")
-        login_html = gr.HTML()
-
-    with gr.Group(visible=False) as cabinet_screen:
-        with gr.Row():
-            gr.Markdown("### 📂 Личный кабинет")
-            logout_btn = gr.Button("🚪 Выйти", elem_id="logout_btn", size="sm")
-
-        with gr.Tabs():
-            with gr.Tab("🚀 Новая транскрибация"):
-                live_progress = gr.HTML(label="Статус")
-                file_in = gr.File(
-                    file_count="multiple",
-                    label="📁 Выберите или перетащите файлы (MP4, WEBM, MP3, OGG, WAV, M4A, MOV до 2 ГБ)",
-                    file_types=["audio", "video", ".webm", ".mp4", ".ogg", ".mp3", ".wav", ".m4a", ".mov", ".mkv"]
-                )
-                with gr.Row():
-                    model_in = gr.Dropdown(["medium", "small"], value="medium", label="🧠 Модель нейросети (medium — максимальная точность, small — быстрее)")
-                    merge_in = gr.Checkbox(label="📑 Объединить несколько файлов в один итоговый .docx отчет", value=False)
-                run_btn = gr.Button("🚀 Запустить транскрибацию", elem_classes=["btn-primary"], size="lg")
-                run_out = gr.Textbox(label="Уведомление", interactive=False, lines=2)
-
-            with gr.Tab("📜 История и файлы"):
-                refresh_btn = gr.Button("🔄 Обновить список")
-                hist_table = gr.Dataframe(
-                    headers=["Дата", "Файл", "Статус / Прогресс", "Скачать документ"],
-                    datatype=["str", "str", "html", "html"],
-                    interactive=False
-                )
-
-    refresh_timer = gr.Timer(2)
-
-    # 1. Загрузка страницы: проверка токена из URL или localStorage через JS
-    def on_page_load(client_token):
-        if client_token:
-            uid = check_login_status(client_token)
-            if uid:
-                history = get_history(uid)
-                active_prog = get_active_task_progress(uid)
-                return uid, client_token, gr.update(visible=False), gr.update(visible=True), history, active_prog, ""
-
-        new_token = str(uuid.uuid4())
-        html = build_login_html(new_token)
-        return "", new_token, gr.update(visible=True), gr.update(visible=False), [], "", html
-
-    demo.load(
-        on_page_load,
-        inputs=[session_token],
-        outputs=[user_id_state, session_token, login_screen, cabinet_screen, hist_table, live_progress, login_html],
-        js="""() => {
-            try {
-                const params = new URLSearchParams(window.location.search);
-                const urlToken = params.get('token');
-                const savedToken = localStorage.getItem('whisper_session_token');
-                const token = urlToken || savedToken || '';
-                if (urlToken) {
-                    try { localStorage.setItem('whisper_session_token', urlToken); } catch(e){}
-                    window.history.replaceState({}, document.title, window.location.pathname);
-                }
-                return token;
-            } catch(e) { return ''; }
-        }"""
-    )
-
-    # 2. Авто-проверка входа по таймеру: если пользователь подтвердил вход в Telegram, сразу переводим в кабинет
-    def check_auto_login(current_uid, current_token):
-        if current_uid:
-            return current_uid, current_token, gr.update(), gr.update()
-        if current_token:
-            uid = check_login_status(current_token)
-            if uid:
-                return uid, current_token, gr.update(visible=False), gr.update(visible=True)
-        return "", current_token, gr.update(), gr.update()
-
-    refresh_timer.tick(
-        check_auto_login,
-        inputs=[user_id_state, session_token],
-        outputs=[user_id_state, session_token, login_screen, cabinet_screen]
-    ).then(
-        fn=lambda token: token,
-        inputs=[session_token],
-        outputs=[],
-        js="""(token) => {
-            if (token) {
-                try { localStorage.setItem('whisper_session_token', token); } catch(e){}
-            }
-        }"""
-    ).then(
-        get_history,
-        inputs=[user_id_state],
-        outputs=[hist_table]
-    ).then(
-        get_active_task_progress,
-        inputs=[user_id_state],
-        outputs=[live_progress]
-    )
-
-    run_btn.click(
-        add_task,
-        inputs=[user_id_state, file_in, model_in, merge_in],
-        outputs=[run_out]
-    ).then(get_active_task_progress, inputs=[user_id_state], outputs=[live_progress]).then(get_history, inputs=[user_id_state], outputs=[hist_table])
-
-    refresh_btn.click(get_history, inputs=[user_id_state], outputs=[hist_table]).then(get_active_task_progress, inputs=[user_id_state], outputs=[live_progress])
-
-    # 3. Выход
-    def do_logout():
-        new_token = str(uuid.uuid4())
-        html = build_login_html(new_token)
-        return "", new_token, gr.update(visible=True), gr.update(visible=False), html
-
-    logout_btn.click(
-        do_logout,
-        outputs=[user_id_state, session_token, login_screen, cabinet_screen, login_html],
-        js="() => { try { localStorage.removeItem('whisper_session_token'); } catch(e){} }"
-    )
-
-# --- FASTAPI ПРИЛОЖЕНИЕ ---
-custom_app = FastAPI(title="Whisper Pro API")
-
-@custom_app.get("/download/{filename}")
+@app.get("/download/{filename}")
 async def download_file(filename: str):
     safe_name = os.path.basename(filename)
     file_path = os.path.join(FILES_DIR, safe_name)
@@ -790,7 +621,7 @@ async def download_file(filename: str):
         filename=safe_name
     )
 
-@custom_app.post("/asr")
+@app.post("/asr")
 async def api_asr(audio_file: UploadFile = File(...)):
     temp_path = os.path.join(DATA_DIR, f"n8n_{audio_file.filename}")
     with open(temp_path, "wb") as buffer:
@@ -825,7 +656,745 @@ async def api_asr(audio_file: UploadFile = File(...)):
             except Exception:
                 pass
 
-custom_app = gr.mount_gradio_app(custom_app, demo.queue(), path="/")
+# --- UI HTML / CSS / JS ---
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Whisper Pro Studio — Транскрибация</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0b0f19;
+      color: #f1f5f9;
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .container {
+      max-width: 1050px;
+      margin: 0 auto;
+      padding: 24px 20px;
+      width: 100%;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 20px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      margin-bottom: 24px;
+    }
+    .logo-box {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo-icon {
+      width: 42px;
+      height: 42px;
+      background: linear-gradient(135deg, #3b82f6, #06b6d4);
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      box-shadow: 0 4px 16px rgba(59, 130, 246, 0.35);
+    }
+    .logo-text h1 {
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: #ffffff;
+    }
+    .logo-text p {
+      font-size: 12px;
+      color: #94a3b8;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(30, 41, 59, 0.7);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      padding: 6px 14px;
+      border-radius: 30px;
+      font-size: 12px;
+      color: #cbd5e1;
+      font-weight: 600;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 10px #10b981;
+    }
+    .glass-card {
+      background: rgba(30, 41, 59, 0.6);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+      margin-bottom: 24px;
+    }
+    /* AUTH SCREEN */
+    .auth-container {
+      text-align: center;
+      padding: 40px 20px;
+      max-width: 540px;
+      margin: 40px auto;
+    }
+    .auth-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      background: linear-gradient(135deg, #0284c7, #0369a1);
+      color: #ffffff;
+      padding: 16px 36px;
+      border-radius: 14px;
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 16px;
+      box-shadow: 0 6px 20px rgba(2, 132, 199, 0.4);
+      transition: all 0.2s ease;
+      cursor: pointer;
+      border: none;
+      margin: 20px 0;
+    }
+    .auth-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 26px rgba(2, 132, 199, 0.6);
+    }
+    .spinner {
+      display: inline-block;
+      width: 18px;
+      height: 18px;
+      border: 2px solid rgba(255,255,255,0.3);
+      border-radius: 50%;
+      border-top-color: #ffffff;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* UPLOAD ZONE */
+    .dropzone {
+      border: 2px dashed rgba(59, 130, 246, 0.4);
+      background: rgba(15, 23, 42, 0.6);
+      border-radius: 14px;
+      padding: 36px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      position: relative;
+    }
+    .dropzone:hover, .dropzone.dragover {
+      border-color: #38bdf8;
+      background: rgba(30, 58, 138, 0.2);
+    }
+    .dropzone-icon {
+      font-size: 42px;
+      margin-bottom: 12px;
+      display: block;
+    }
+    .file-input {
+      position: absolute;
+      top: 0; left: 0; width: 100%; height: 100%;
+      opacity: 0;
+      cursor: pointer;
+    }
+    .file-list-preview {
+      margin-top: 14px;
+      font-size: 13px;
+      color: #38bdf8;
+      font-weight: 600;
+    }
+    .controls-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 20px;
+    }
+    @media (max-width: 640px) {
+      .controls-grid { grid-template-columns: 1fr; }
+    }
+    .form-group label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: #94a3b8;
+      margin-bottom: 8px;
+    }
+    .select-input {
+      width: 100%;
+      background: #0f172a;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      color: #ffffff;
+      padding: 12px 14px;
+      font-size: 14px;
+      font-weight: 500;
+      outline: none;
+    }
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 32px;
+      cursor: pointer;
+      font-size: 14px;
+      color: #e2e8f0;
+      font-weight: 600;
+    }
+    .btn-submit {
+      width: 100%;
+      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      color: #ffffff;
+      padding: 16px;
+      border-radius: 12px;
+      font-size: 16px;
+      font-weight: 700;
+      border: none;
+      cursor: pointer;
+      box-shadow: 0 6px 20px rgba(37, 99, 235, 0.4);
+      margin-top: 20px;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+    .btn-submit:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(37, 99, 235, 0.6);
+    }
+    .btn-submit:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    /* LIVE TASK CARD */
+    .active-card {
+      border: 1px solid rgba(59, 130, 246, 0.4);
+      background: linear-gradient(135deg, rgba(30, 41, 59, 0.8), rgba(15, 23, 42, 0.9));
+    }
+    .progress-bar-container {
+      background: #1e2330;
+      border: 1px solid #334155;
+      border-radius: 14px;
+      height: 32px;
+      overflow: hidden;
+      position: relative;
+      margin-top: 14px;
+      box-shadow: inset 0 2px 4px rgba(0,0,0,0.5);
+    }
+    .progress-fill {
+      background: linear-gradient(90deg, #2563eb, #06b6d4, #10b981);
+      height: 100%;
+      transition: width 0.4s ease-in-out;
+      box-shadow: 0 0 14px rgba(6, 182, 212, 0.6);
+    }
+    .progress-text {
+      position: absolute;
+      top: 0; left: 0; width: 100%; height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      font-weight: 700;
+      color: #ffffff;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+    }
+    .btn-dl-ready {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: linear-gradient(135deg, #10b981, #059669);
+      color: #ffffff;
+      padding: 10px 20px;
+      border-radius: 10px;
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 14px;
+      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+      margin-top: 14px;
+    }
+
+    /* HISTORY TABLE */
+    .table-container {
+      overflow-x: auto;
+      margin-top: 14px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th {
+      text-align: left;
+      padding: 12px 14px;
+      color: #94a3b8;
+      font-weight: 600;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    td {
+      padding: 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      color: #e2e8f0;
+    }
+    .status-pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 12px;
+    }
+    .status-pill.done { background: #132e1e; color: #4ade80; border: 1px solid #166534; }
+    .status-pill.working { background: #2d2616; color: #fbbf24; border: 1px solid #78350f; }
+    .status-pill.error { background: #331919; color: #f87171; border: 1px solid #991b1b; }
+    .btn-table-dl {
+      display: inline-block;
+      background: #2563eb;
+      color: #ffffff;
+      padding: 5px 12px;
+      border-radius: 6px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 12px;
+    }
+    .logout-btn {
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: #94a3b8;
+      padding: 6px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      transition: all 0.2s;
+    }
+    .logout-btn:hover {
+      background: rgba(239, 68, 68, 0.2);
+      color: #f87171;
+      border-color: #ef4444;
+    }
+    .tabs {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 8px;
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: #94a3b8;
+      font-weight: 700;
+      font-size: 14px;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .tab-btn.active {
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="logo-box">
+        <div class="logo-icon">🎙</div>
+        <div class="logo-text">
+          <h1>Whisper Pro Studio</h1>
+          <p>Сверхточная транскрибация аудио и видео</p>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div class="status-badge">
+          <span class="dot"></span>
+          <span>Сервер онлайн</span>
+        </div>
+        <button id="logoutBtn" class="logout-btn hidden" onclick="handleLogout()">🚪 Выйти</button>
+      </div>
+    </header>
+
+    <!-- ЭКРАН АВТОРИЗАЦИИ -->
+    <div id="authScreen" class="glass-card auth-container">
+      <h2 style="font-size:22px;margin-bottom:8px;">👋 Авторизация</h2>
+      <p style="color:#94a3b8;font-size:14px;margin-bottom:24px;">Для доступа к расшифровкам и мгновенного получения документов в Telegram:</p>
+      
+      <div>
+        <a id="tgLoginBtn" href="#" target="_blank" class="auth-btn">
+          ✈️ Войти через Telegram-бота
+        </a>
+      </div>
+
+      <div style="display:flex;align-items:center;justify-content:center;gap:8px;color:#94a3b8;font-size:13px;margin-top:12px;">
+        <span class="spinner"></span>
+        <span>Ожидание подтверждения... Вход выполнится <b>автоматически</b>.</span>
+      </div>
+    </div>
+
+    <!-- ЛИЧНЫЙ КАБИНЕТ -->
+    <div id="cabinetScreen" class="hidden">
+      <!-- Активная задача (Live Card) -->
+      <div id="activeTaskBox" class="glass-card active-card hidden">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div style="font-weight:700;font-size:15px;color:#e2e8f0;">
+            🔥 Текущая задача: <span id="activeFileName" style="color:#38bdf8;"></span>
+          </div>
+          <span id="activeTime" style="font-size:12px;color:#94a3b8;"></span>
+        </div>
+        <div class="progress-bar-container">
+          <div id="progressFill" class="progress-fill" style="width:0%;"></div>
+          <div id="progressText" class="progress-text">⏳ Инициализация...</div>
+        </div>
+        <div id="activeDlBox" style="text-align:right;"></div>
+      </div>
+
+      <!-- Вкладки -->
+      <div class="tabs">
+        <button id="tabNewBtn" class="tab-btn active" onclick="switchTab('new')">🚀 Новая транскрибация</button>
+        <button id="tabHistoryBtn" class="tab-btn" onclick="switchTab('history')">📜 История и файлы (<span id="taskCount">0</span>)</button>
+      </div>
+
+      <!-- Вкладка: Загрузка -->
+      <div id="tabNew" class="glass-card">
+        <div class="dropzone" id="dropzone">
+          <span class="dropzone-icon">📁</span>
+          <h3 style="font-size:16px;font-weight:700;margin-bottom:4px;">Перетащите файлы сюда или нажмите для выбора</h3>
+          <p style="font-size:12px;color:#94a3b8;">MP4, WEBM, MP3, OGG, WAV, M4A, MOV, MKV (до 2 ГБ)</p>
+          <input type="file" id="fileInput" class="file-input" multiple accept="audio/*,video/*,.webm,.mp4,.ogg,.mp3,.wav,.m4a,.mov,.mkv">
+          <div id="filePreview" class="file-list-preview hidden"></div>
+        </div>
+
+        <div class="controls-grid">
+          <div class="form-group">
+            <label>🧠 Модель нейросети</label>
+            <select id="modelSelect" class="select-input">
+              <option value="medium" selected>medium (Максимальная точность — рекомендуется)</option>
+              <option value="small">small (Быстрая обработка)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="mergeCheckbox" style="width:18px;height:18px;">
+              <span>📑 Объединить файлы в один общий .docx отчет</span>
+            </label>
+          </div>
+        </div>
+
+        <button id="submitBtn" class="btn-submit" onclick="submitFiles()">
+          <span>🚀 Запустить транскрибацию</span>
+        </button>
+
+        <div id="uploadStatusText" style="text-align:center;margin-top:14px;font-size:13px;color:#38bdf8;font-weight:600;"></div>
+      </div>
+
+      <!-- Вкладка: История -->
+      <div id="tabHistory" class="glass-card hidden">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <h3 style="font-size:16px;font-weight:700;">📜 Ваши расшифровки</h3>
+          <button class="logout-btn" onclick="fetchTasks()">🔄 Обновить</button>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Дата</th>
+                <th>Файл</th>
+                <th>Статус</th>
+                <th>Документ</th>
+              </tr>
+            </thead>
+            <tbody id="historyTableBody">
+              <tr><td colspan="4" style="text-align:center;color:#64748b;">Загрузка истории...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    let currentAuthToken = localStorage.getItem('whisper_session_token') || '';
+    let pollAuthTimer = null;
+    let pollTasksTimer = null;
+
+    // Инициализация
+    window.addEventListener('DOMContentLoaded', async () => {
+      // Проверяем параметр ?token= в URL (если пришли из Telegram)
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlToken = urlParams.get('token');
+      if (urlToken) {
+        currentAuthToken = urlToken;
+        localStorage.setItem('whisper_session_token', urlToken);
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
+
+      await checkInitialAuth();
+      setupDropzone();
+    });
+
+    async function checkInitialAuth() {
+      try {
+        const res = await fetch('/api/tasks');
+        if (res.ok) {
+          const data = await res.json();
+          renderCabinet(data);
+          startTaskPolling();
+          return;
+        }
+      } catch (e) {}
+
+      // Если есть сохраненный токен в localStorage, проверим его статус
+      if (currentAuthToken) {
+        try {
+          const res = await fetch(`/api/auth/status?token=${currentAuthToken}`);
+          const data = await res.json();
+          if (data.authenticated) {
+            const taskRes = await fetch('/api/tasks');
+            if (taskRes.ok) {
+              renderCabinet(await taskRes.json());
+              startTaskPolling();
+              return;
+            }
+          }
+        } catch (e) {}
+      }
+
+      // Показываем экран логина
+      showLoginScreen();
+    }
+
+    async function showLoginScreen() {
+      document.getElementById('authScreen').classList.remove('hidden');
+      document.getElementById('cabinetScreen').classList.add('hidden');
+      document.getElementById('logoutBtn').classList.add('hidden');
+
+      if (pollTasksTimer) clearInterval(pollTasksTimer);
+
+      // Получаем новый токен и ссылку
+      try {
+        const res = await fetch('/api/auth/token');
+        const data = await res.json();
+        currentAuthToken = data.token;
+        document.getElementById('tgLoginBtn').href = data.tg_url;
+
+        // Запускаем фоновый опрос подтверждения
+        if (pollAuthTimer) clearInterval(pollAuthTimer);
+        pollAuthTimer = setInterval(async () => {
+          try {
+            const stRes = await fetch(`/api/auth/status?token=${currentAuthToken}`);
+            const stData = await stRes.json();
+            if (stData.authenticated) {
+              clearInterval(pollAuthTimer);
+              localStorage.setItem('whisper_session_token', currentAuthToken);
+              const taskRes = await fetch('/api/tasks');
+              if (taskRes.ok) {
+                renderCabinet(await taskRes.json());
+                startTaskPolling();
+              }
+            }
+          } catch(e){}
+        }, 1500);
+      } catch (e) {
+        console.error('Error fetching auth token:', e);
+      }
+    }
+
+    function renderCabinet(data) {
+      document.getElementById('authScreen').classList.add('hidden');
+      document.getElementById('cabinetScreen').classList.remove('hidden');
+      document.getElementById('logoutBtn').classList.remove('hidden');
+
+      updateActiveTask(data.active_task);
+      updateHistoryTable(data.tasks);
+    }
+
+    function updateActiveTask(task) {
+      const box = document.getElementById('activeTaskBox');
+      if (!task) {
+        box.classList.add('hidden');
+        return;
+      }
+      box.classList.remove('hidden');
+      document.getElementById('activeFileName').textContent = task.filename;
+      document.getElementById('activeTime').textContent = task.created_at;
+
+      const fill = document.getElementById('progressFill');
+      const txt = document.getElementById('progressText');
+      txt.textContent = task.status;
+
+      let p = task.percent;
+      if (p === null || p === undefined) {
+        p = task.status.includes('Очередь') ? 5 : (task.status.includes('Извлечение') ? 15 : 25);
+      }
+      fill.style.width = Math.min(100, Math.max(5, p)) + '%';
+
+      const dlBox = document.getElementById('activeDlBox');
+      if (task.download_url) {
+        dlBox.innerHTML = `<a href="${task.download_url}" download class="btn-dl-ready">📥 Скачать готовый DOCX</a>`;
+      } else {
+        dlBox.innerHTML = '';
+      }
+    }
+
+    function updateHistoryTable(tasks) {
+      document.getElementById('taskCount').textContent = tasks.length;
+      const tbody = document.getElementById('historyTableBody');
+      if (!tasks || tasks.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#64748b;">Нет созданных задач</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = tasks.map(t => {
+        let pillClass = 'working';
+        if (t.status.includes('✅') || t.status.includes('Готово')) pillClass = 'done';
+        else if (t.status.includes('❌') || t.status.includes('Ошибка')) pillClass = 'error';
+
+        let linkHtml = t.download_url 
+          ? `<a href="${t.download_url}" download class="btn-table-dl">📥 Скачать .docx</a>`
+          : '<span style="color:#64748b;">—</span>';
+
+        return `<tr>
+          <td>${t.created_at}</td>
+          <td style="font-weight:600;">${t.filename}</td>
+          <td><span class="status-pill ${pillClass}">${t.status}</span></td>
+          <td>${linkHtml}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function fetchTasks() {
+      try {
+        const res = await fetch('/api/tasks');
+        if (res.ok) {
+          const data = await res.json();
+          renderCabinet(data);
+        }
+      } catch (e){}
+    }
+
+    function startTaskPolling() {
+      if (pollTasksTimer) clearInterval(pollTasksTimer);
+      pollTasksTimer = setInterval(fetchTasks, 2500);
+    }
+
+    function switchTab(tab) {
+      if (tab === 'new') {
+        document.getElementById('tabNew').classList.remove('hidden');
+        document.getElementById('tabHistory').classList.add('hidden');
+        document.getElementById('tabNewBtn').classList.add('active');
+        document.getElementById('tabHistoryBtn').classList.remove('active');
+      } else {
+        document.getElementById('tabNew').classList.add('hidden');
+        document.getElementById('tabHistory').classList.remove('hidden');
+        document.getElementById('tabNewBtn').classList.remove('active');
+        document.getElementById('tabHistoryBtn').classList.add('active');
+        fetchTasks();
+      }
+    }
+
+    function setupDropzone() {
+      const dropzone = document.getElementById('dropzone');
+      const fileInput = document.getElementById('fileInput');
+      const preview = document.getElementById('filePreview');
+
+      ['dragenter', 'dragover'].forEach(name => {
+        dropzone.addEventListener(name, (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+      });
+      ['dragleave', 'drop'].forEach(name => {
+        dropzone.addEventListener(name, (e) => { e.preventDefault(); dropzone.classList.remove('dragover'); });
+      });
+
+      fileInput.addEventListener('change', () => {
+        if (fileInput.files.length > 0) {
+          preview.classList.remove('hidden');
+          preview.textContent = `Выбрано файлов: ${fileInput.files.length} шт. (` + Array.from(fileInput.files).map(f => f.name).join(', ') + ')';
+        } else {
+          preview.classList.add('hidden');
+        }
+      });
+    }
+
+    async function submitFiles() {
+      const fileInput = document.getElementById('fileInput');
+      if (!fileInput.files || fileInput.files.length === 0) {
+        alert('Пожалуйста, выберите файлы для загрузки');
+        return;
+      }
+
+      const submitBtn = document.getElementById('submitBtn');
+      const statusText = document.getElementById('uploadStatusText');
+      submitBtn.disabled = true;
+
+      const formData = new FormData();
+      for (let i = 0; i < fileInput.files.length; i++) {
+        formData.append('files', fileInput.files[i]);
+      }
+      formData.append('model_size', document.getElementById('modelSelect').value);
+      formData.append('merge_mode', document.getElementById('mergeCheckbox').checked);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/tasks/create', true);
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const percent = Math.round((e.loaded / e.total) * 100);
+          statusText.textContent = `⏳ Загрузка на сервер: ${percent}%...`;
+        }
+      };
+
+      xhr.onload = async () => {
+        submitBtn.disabled = false;
+        if (xhr.status === 200) {
+          statusText.textContent = '🚀 Успешно отправлено в обработку! Результат придёт в Telegram и появится ниже.';
+          fileInput.value = '';
+          document.getElementById('filePreview').classList.add('hidden');
+          await fetchTasks();
+          setTimeout(() => { statusText.textContent = ''; }, 4000);
+        } else {
+          statusText.textContent = '❌ Ошибка при загрузке: ' + xhr.responseText;
+        }
+      };
+
+      xhr.onerror = () => {
+        submitBtn.disabled = false;
+        statusText.textContent = '❌ Ошибка сети при отправке файлов.';
+      };
+
+      xhr.send(formData);
+    }
+
+    async function handleLogout() {
+      localStorage.removeItem('whisper_session_token');
+      try {
+        await fetch('/api/auth/logout', { method: 'POST' });
+      } catch (e) {}
+      showLoginScreen();
+    }
+  </script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index(request: Request):
+    return HTMLResponse(content=HTML_PAGE)
 
 def start_background_services():
     if getattr(start_background_services, "_started", False):
@@ -844,4 +1413,4 @@ def start_background_services():
 
 if __name__ == "__main__":
     start_background_services()
-    uvicorn.run(custom_app, host="0.0.0.0", port=7860)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
