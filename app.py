@@ -34,7 +34,7 @@ os.makedirs(FILES_DIR, exist_ok=True)
 os.makedirs(AUDIO_TEMP_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(TG_BOT_TOKEN)
-app = FastAPI(title="Whisper Pro Studio", version="2.0.0")
+app = FastAPI(title="Whisper Pro Studio", version="2.1.0")
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
@@ -94,9 +94,6 @@ def send_file_to_tg(user_id, filepath, caption):
         print(f"Error sending file to TG: {e}")
 
 def extract_audio(input_file_path):
-    """
-    Мгновенно извлекает звук через ffmpeg в 16kHz mono WAV для Whisper.
-    """
     base_name = os.path.splitext(os.path.basename(input_file_path))[0]
     out_wav = os.path.join(AUDIO_TEMP_DIR, f"{base_name}_{uuid.uuid4().hex[:6]}.wav")
     
@@ -126,7 +123,7 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         db_update_status(task_id, "⏳ 1/3 Извлечение звуковой дорожки...")
         extracted_audio = extract_audio(file_path)
 
-        db_update_status(task_id, f"⏳ 2/3 Инициализация модели ({model_size})...")
+        db_update_status(task_id, f"⏳ 2/3 Загрузка модели ({model_size})...")
         model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=4)
 
         db_update_status(task_id, "⏳ 3/3 Расшифровка: 0%")
@@ -159,7 +156,6 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
 
         db_update_status(task_id, "⏳ Формирование документов...")
         
-        # 1. Сохраняем текстовый вариант
         txt_filename = f"Transcription_{int(time.time())}_{task_id}.txt"
         txt_path = os.path.join(FILES_DIR, txt_filename)
         
@@ -176,7 +172,6 @@ def process_single_file(user_id, file_path, original_name, model_size, task_id):
         with open(txt_path, "w", encoding="utf-8") as tf:
             tf.write(f"Файл: {original_name}\nМодель: {model_size}\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n" + content_str)
 
-        # 2. Сохраняем Word .docx
         doc.add_paragraph(f"Файл: {original_name}\nМодель: {model_size}\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n" + content_str)
         res_filename = f"Transcription_{int(time.time())}_{task_id}.docx"
         res_path = os.path.join(FILES_DIR, res_filename)
@@ -204,7 +199,7 @@ def process_merged_batch(user_id, file_list, model_size, task_id):
     try:
         from faster_whisper import WhisperModel
 
-        db_update_status(task_id, f"⏳ Инициализация модели ({model_size})...")
+        db_update_status(task_id, f"⏳ Загрузка модели ({model_size})...")
         model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=4)
         doc = Document()
         doc.add_paragraph(f"Сводный отчет (Файлов: {len(file_list)})\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -338,7 +333,6 @@ def bot_polling():
         try:
             bot.polling(none_stop=True, interval=2, timeout=20)
         except Exception as e:
-            print(f"Bot polling exception: {e}")
             time.sleep(5)
 
 @bot.message_handler(commands=['start'])
@@ -441,20 +435,17 @@ def handle_incoming_file(message):
 # --- FASTAPI AUTH & API ENDPOINTS ---
 
 def get_current_user_id(request: Request):
-    # 1. Cookie
     cookie_token = request.cookies.get("whisper_token")
     if cookie_token:
         uid = get_user_id_from_token(cookie_token)
         if uid:
             return uid
-    # 2. Header
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         bearer_token = auth_header.replace("Bearer ", "").strip()
         uid = get_user_id_from_token(bearer_token)
         if uid:
             return uid
-    # 3. Query param token fallback
     query_token = request.query_params.get("token")
     if query_token:
         uid = get_user_id_from_token(query_token)
@@ -464,7 +455,6 @@ def get_current_user_id(request: Request):
 
 @app.get("/login/callback")
 async def login_callback(token: str):
-    """Прямой редирект из Telegram: ставит cookie на 30 дней и перенаправляет в кабинет"""
     uid = get_user_id_from_token(token)
     response = RedirectResponse(url="/", status_code=302)
     if uid:
@@ -575,14 +565,13 @@ async def get_task_text(task_id: int, request: Request):
 
     fname, rpath = row
     if not rpath or not os.path.exists(rpath):
-        return {"filename": fname, "text": "Текст еще не сформирован"}
+        return {"filename": fname, "text": "Текст еще формируется..."}
 
     txt_path = rpath.replace(".docx", ".txt")
     if os.path.exists(txt_path):
         with open(txt_path, "r", encoding="utf-8") as f:
             return {"filename": fname, "text": f.read()}
 
-    # Fallback to reading docx
     try:
         doc = Document(rpath)
         full_txt = "\n".join([p.text for p in doc.paragraphs])
@@ -706,7 +695,7 @@ async def api_asr(audio_file: UploadFile = File(...)):
             except Exception:
                 pass
 
-# --- PRODUCTION-GRADE WEB APP FRONTEND (HTML5 + MODERN CSS + JS) ---
+# --- UI HTML / CSS / JS ---
 HTML_APP = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -903,16 +892,51 @@ HTML_APP = """<!DOCTYPE html>
       opacity: 0;
       cursor: pointer;
     }
-    .file-preview {
-      margin-top: 14px;
-      font-size: 14px;
-      color: #38bdf8;
-      font-weight: 600;
-      background: rgba(56, 189, 248, 0.1);
-      padding: 10px 14px;
-      border-radius: var(--radius-sm);
-      display: inline-block;
+    .file-preview-card {
+      margin-top: 16px;
+      background: rgba(30, 41, 59, 0.85);
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      border-radius: var(--radius-md);
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      text-align: left;
     }
+    .file-info-name {
+      font-size: 14px;
+      font-weight: 700;
+      color: #38bdf8;
+    }
+    .file-info-size {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    /* UPLOAD PROGRESS BOX */
+    .upload-progress-box {
+      margin-top: 18px;
+      background: #0f172a;
+      border: 1px solid var(--border-accent);
+      border-radius: var(--radius-md);
+      padding: 16px;
+    }
+    .upload-bar-track {
+      background: #1e293b;
+      border-radius: 8px;
+      height: 12px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    .upload-bar-fill {
+      background: linear-gradient(90deg, #3b82f6, #06b6d4);
+      height: 100%;
+      width: 0%;
+      transition: width 0.15s ease;
+      box-shadow: 0 0 10px rgba(6, 182, 212, 0.8);
+    }
+
     .controls-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -958,9 +982,9 @@ HTML_APP = """<!DOCTYPE html>
       width: 100%;
       background: linear-gradient(135deg, var(--primary), #1e40af);
       color: #ffffff;
-      padding: 16px;
+      padding: 18px;
       border-radius: var(--radius-md);
-      font-size: 16px;
+      font-size: 17px;
       font-weight: 800;
       border: none;
       cursor: pointer;
@@ -970,11 +994,11 @@ HTML_APP = """<!DOCTYPE html>
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 10px;
+      gap: 12px;
     }
     .btn-submit:hover:not(:disabled) {
       transform: translateY(-2px);
-      box-shadow: 0 8px 26px rgba(37, 99, 235, 0.6);
+      box-shadow: 0 8px 28px rgba(37, 99, 235, 0.65);
     }
     .btn-submit:disabled {
       opacity: 0.6;
@@ -1268,7 +1292,26 @@ HTML_APP = """<!DOCTYPE html>
           <h3 style="font-size:17px;font-weight:800;margin-bottom:4px;">Перетащите аудио или видео файлы сюда</h3>
           <p style="font-size:13px;color:#94a3b8;">Поддерживаются: MP4, WEBM, MP3, OGG, WAV, M4A, MOV, MKV до 2 ГБ</p>
           <input type="file" id="fileInput" class="file-input" multiple accept="audio/*,video/*,.webm,.mp4,.ogg,.mp3,.wav,.m4a,.mov,.mkv">
-          <div id="filePreview" class="file-preview hidden"></div>
+          
+          <div id="filePreviewCard" class="file-preview-card hidden">
+            <div>
+              <div id="filePreviewName" class="file-info-name"></div>
+              <div id="filePreviewSize" class="file-info-size"></div>
+            </div>
+            <span style="font-size:20px;">✅</span>
+          </div>
+        </div>
+
+        <!-- Индикатор реальной отправки на сервер -->
+        <div id="uploadProgressBox" class="upload-progress-box hidden">
+          <div style="display:flex;justify-content:space-between;font-size:13px;font-weight:700;">
+            <span id="uploadStatusTitle" style="color:#38bdf8;">📤 Отправка файла на сервер...</span>
+            <span id="uploadPercentText" style="color:#ffffff;font-family:var(--font-mono);">0%</span>
+          </div>
+          <div class="upload-bar-track">
+            <div id="uploadBarFill" class="upload-bar-fill"></div>
+          </div>
+          <div id="uploadBytesText" style="font-size:11px;color:#94a3b8;margin-top:6px;text-align:right;font-family:var(--font-mono);"></div>
         </div>
 
         <div class="controls-grid">
@@ -1288,10 +1331,8 @@ HTML_APP = """<!DOCTYPE html>
         </div>
 
         <button id="submitBtn" class="btn-submit" onclick="submitFiles()">
-          <span>🚀 Запустить транскрибацию</span>
+          <span id="submitBtnText">🚀 Запустить транскрибацию</span>
         </button>
-
-        <div id="uploadStatusText" style="text-align:center;margin-top:14px;font-size:13px;color:#38bdf8;font-weight:700;"></div>
       </div>
 
       <!-- Вкладка: История -->
@@ -1341,7 +1382,6 @@ HTML_APP = """<!DOCTYPE html>
     let pollTasksTimer = null;
 
     window.addEventListener('DOMContentLoaded', async () => {
-      // 1. Проверяем URL параметр ?token=
       const urlParams = new URLSearchParams(window.location.search);
       const urlToken = urlParams.get('token');
       if (urlToken) {
@@ -1355,7 +1395,6 @@ HTML_APP = """<!DOCTYPE html>
     });
 
     async function initAuthFlow() {
-      // Попробуем запросить задачи напрямую (если есть куки)
       try {
         const res = await fetch('/api/tasks');
         if (res.ok) {
@@ -1366,7 +1405,6 @@ HTML_APP = """<!DOCTYPE html>
         }
       } catch (e) {}
 
-      // Если в localStorage сохранен токен, проверим его статус
       if (currentAuthToken) {
         try {
           const res = await fetch(`/api/auth/status?token=${currentAuthToken}`);
@@ -1382,7 +1420,6 @@ HTML_APP = """<!DOCTYPE html>
         } catch (e) {}
       }
 
-      // Не авторизован -> показываем экран логина
       showLoginScreen();
     }
 
@@ -1399,7 +1436,6 @@ HTML_APP = """<!DOCTYPE html>
         currentAuthToken = data.token;
         document.getElementById('tgLoginBtn').href = data.tg_url;
 
-        // Поллинг подтверждения
         if (pollAuthTimer) clearInterval(pollAuthTimer);
         pollAuthTimer = setInterval(async () => {
           try {
@@ -1528,10 +1564,21 @@ HTML_APP = """<!DOCTYPE html>
       }
     }
 
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0 Bytes';
+      const k = 1024;
+      const sizes = ['Bytes', 'КБ', 'МБ', 'ГБ'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
     function setupDropzone() {
       const dropzone = document.getElementById('dropzone');
       const fileInput = document.getElementById('fileInput');
-      const preview = document.getElementById('filePreview');
+      const previewCard = document.getElementById('filePreviewCard');
+      const previewName = document.getElementById('filePreviewName');
+      const previewSize = document.getElementById('filePreviewSize');
+      const submitBtnText = document.getElementById('submitBtnText');
 
       ['dragenter', 'dragover'].forEach(name => {
         dropzone.addEventListener(name, (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
@@ -1542,10 +1589,22 @@ HTML_APP = """<!DOCTYPE html>
 
       fileInput.addEventListener('change', () => {
         if (fileInput.files.length > 0) {
-          preview.classList.remove('hidden');
-          preview.textContent = `Выбрано файлов: ${fileInput.files.length} шт. (` + Array.from(fileInput.files).map(f => f.name).join(', ') + ')';
+          previewCard.classList.remove('hidden');
+          let totalBytes = 0;
+          for (let f of fileInput.files) totalBytes += f.size;
+
+          if (fileInput.files.length === 1) {
+            previewName.textContent = fileInput.files[0].name;
+            previewSize.textContent = `Размер файла: ${formatBytes(fileInput.files[0].size)} • Готов к отправке`;
+            submitBtnText.textContent = `🚀 Отправить и расшифровать (${formatBytes(fileInput.files[0].size)})`;
+          } else {
+            previewName.textContent = `Выбрано файлов: ${fileInput.files.length} шт.`;
+            previewSize.textContent = `Общий размер: ${formatBytes(totalBytes)} • Готовы к отправке`;
+            submitBtnText.textContent = `🚀 Отправить и расшифровать (${fileInput.files.length} файлов, ${formatBytes(totalBytes)})`;
+          }
         } else {
-          preview.classList.add('hidden');
+          previewCard.classList.add('hidden');
+          submitBtnText.textContent = '🚀 Запустить транскрибацию';
         }
       });
     }
@@ -1553,13 +1612,23 @@ HTML_APP = """<!DOCTYPE html>
     async function submitFiles() {
       const fileInput = document.getElementById('fileInput');
       if (!fileInput.files || fileInput.files.length === 0) {
-        alert('Пожалуйста, выберите файлы для загрузки');
+        alert('Пожалуйста, выберите хотя бы один аудио или видео файл перед отправкой');
         return;
       }
 
       const submitBtn = document.getElementById('submitBtn');
-      const statusText = document.getElementById('uploadStatusText');
+      const submitBtnText = document.getElementById('submitBtnText');
+      const uploadBox = document.getElementById('uploadProgressBox');
+      const uploadBarFill = document.getElementById('uploadBarFill');
+      const uploadPercentText = document.getElementById('uploadPercentText');
+      const uploadBytesText = document.getElementById('uploadBytesText');
+      const uploadTitle = document.getElementById('uploadStatusTitle');
+
       submitBtn.disabled = true;
+      uploadBox.classList.remove('hidden');
+      uploadBarFill.style.width = '0%';
+      uploadPercentText.textContent = '0%';
+      uploadTitle.textContent = '📤 Отправка файла на сервер...';
 
       const formData = new FormData();
       for (let i = 0; i < fileInput.files.length; i++) {
@@ -1574,26 +1643,36 @@ HTML_APP = """<!DOCTYPE html>
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
           const percent = Math.round((e.loaded / e.total) * 100);
-          statusText.textContent = `⏳ Загрузка на сервер: ${percent}%...`;
+          uploadBarFill.style.width = percent + '%';
+          uploadPercentText.textContent = percent + '%';
+          uploadBytesText.textContent = `${formatBytes(e.loaded)} / ${formatBytes(e.total)}`;
+          submitBtnText.innerHTML = `<span class="spinner"></span> Отправка на сервер: ${percent}%...`;
         }
       };
 
       xhr.onload = async () => {
         submitBtn.disabled = false;
         if (xhr.status === 200) {
-          statusText.textContent = '🚀 Успешно отправлено в обработку! Результат появится ниже и придёт в Telegram.';
+          uploadBarFill.style.width = '100%';
+          uploadPercentText.textContent = '100%';
+          uploadTitle.textContent = '✅ Файл успешно передан серверу! Нейросеть начала обработку...';
+          submitBtnText.textContent = '🚀 Запустить транскрибацию';
           fileInput.value = '';
-          document.getElementById('filePreview').classList.add('hidden');
+          document.getElementById('filePreviewCard').classList.add('hidden');
+          
           await fetchTasks();
-          setTimeout(() => { statusText.textContent = ''; }, 4000);
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          setTimeout(() => { uploadBox.classList.add('hidden'); }, 3500);
         } else {
-          statusText.textContent = '❌ Ошибка при загрузке: ' + xhr.responseText;
+          uploadTitle.textContent = '❌ Ошибка при отправке: ' + xhr.responseText;
+          submitBtnText.textContent = '🚀 Запустить транскрибацию';
         }
       };
 
       xhr.onerror = () => {
         submitBtn.disabled = false;
-        statusText.textContent = '❌ Ошибка сети при отправке файлов.';
+        uploadTitle.textContent = '❌ Ошибка соединения с сервером.';
+        submitBtnText.textContent = '🚀 Запустить транскрибацию';
       };
 
       xhr.send(formData);
