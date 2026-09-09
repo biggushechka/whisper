@@ -1572,46 +1572,91 @@ HTML_APP = """<!DOCTYPE html>
       return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
     }
 
-    function setupDropzone() {
-      const dropzone = document.getElementById('dropzone');
+    let selectedFiles = [];
+
+    function updateFilesDisplay(files) {
+      if (!files || files.length === 0) {
+        selectedFiles = [];
+        document.getElementById('filePreviewCard').classList.add('hidden');
+        document.getElementById('submitBtnText').textContent = '🚀 Запустить транскрибацию';
+        return;
+      }
+      selectedFiles = Array.from(files);
       const fileInput = document.getElementById('fileInput');
+      try {
+        const dt = new DataTransfer();
+        for (let f of selectedFiles) dt.items.add(f);
+        fileInput.files = dt.files;
+      } catch (err) {}
+
       const previewCard = document.getElementById('filePreviewCard');
       const previewName = document.getElementById('filePreviewName');
       const previewSize = document.getElementById('filePreviewSize');
       const submitBtnText = document.getElementById('submitBtnText');
 
+      previewCard.classList.remove('hidden');
+      let totalBytes = 0;
+      for (let f of selectedFiles) totalBytes += f.size;
+
+      if (selectedFiles.length === 1) {
+        previewName.textContent = selectedFiles[0].name;
+        previewSize.textContent = `Размер файла: ${formatBytes(selectedFiles[0].size)} • Готов к отправке`;
+        submitBtnText.textContent = `🚀 Отправить и расшифровать (${formatBytes(selectedFiles[0].size)})`;
+      } else {
+        previewName.textContent = `Выбрано файлов: ${selectedFiles.length} шт.`;
+        previewSize.textContent = `Общий размер: ${formatBytes(totalBytes)} • Готовы к отправке`;
+        submitBtnText.textContent = `🚀 Отправить и расшифровать (${selectedFiles.length} файлов, ${formatBytes(totalBytes)})`;
+      }
+    }
+
+    function setupDropzone() {
+      const dropzone = document.getElementById('dropzone');
+      const fileInput = document.getElementById('fileInput');
+
+      window.addEventListener('dragover', (e) => e.preventDefault());
+      window.addEventListener('drop', (e) => e.preventDefault());
+
       ['dragenter', 'dragover'].forEach(name => {
-        dropzone.addEventListener(name, (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+        dropzone.addEventListener(name, (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          dropzone.classList.add('dragover');
+        });
       });
-      ['dragleave', 'drop'].forEach(name => {
-        dropzone.addEventListener(name, (e) => { e.preventDefault(); dropzone.classList.remove('dragover'); });
+
+      ['dragleave'].forEach(name => {
+        dropzone.addEventListener(name, (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          dropzone.classList.remove('dragover');
+        });
+      });
+
+      dropzone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropzone.classList.remove('dragover');
+        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          updateFilesDisplay(e.dataTransfer.files);
+        }
       });
 
       fileInput.addEventListener('change', () => {
-        if (fileInput.files.length > 0) {
-          previewCard.classList.remove('hidden');
-          let totalBytes = 0;
-          for (let f of fileInput.files) totalBytes += f.size;
-
-          if (fileInput.files.length === 1) {
-            previewName.textContent = fileInput.files[0].name;
-            previewSize.textContent = `Размер файла: ${formatBytes(fileInput.files[0].size)} • Готов к отправке`;
-            submitBtnText.textContent = `🚀 Отправить и расшифровать (${formatBytes(fileInput.files[0].size)})`;
-          } else {
-            previewName.textContent = `Выбрано файлов: ${fileInput.files.length} шт.`;
-            previewSize.textContent = `Общий размер: ${formatBytes(totalBytes)} • Готовы к отправке`;
-            submitBtnText.textContent = `🚀 Отправить и расшифровать (${fileInput.files.length} файлов, ${formatBytes(totalBytes)})`;
-          }
+        if (fileInput.files && fileInput.files.length > 0) {
+          updateFilesDisplay(fileInput.files);
         } else {
-          previewCard.classList.add('hidden');
-          submitBtnText.textContent = '🚀 Запустить транскрибацию';
+          updateFilesDisplay([]);
         }
       });
     }
 
     async function submitFiles() {
       const fileInput = document.getElementById('fileInput');
-      if (!fileInput.files || fileInput.files.length === 0) {
+      const filesToUpload = (selectedFiles && selectedFiles.length > 0)
+        ? selectedFiles
+        : Array.from(fileInput.files || []);
+
+      if (!filesToUpload || filesToUpload.length === 0) {
         alert('Пожалуйста, выберите хотя бы один аудио или видео файл перед отправкой');
         return;
       }
@@ -1631,8 +1676,8 @@ HTML_APP = """<!DOCTYPE html>
       uploadTitle.textContent = '📤 Отправка файла на сервер...';
 
       const formData = new FormData();
-      for (let i = 0; i < fileInput.files.length; i++) {
-        formData.append('files', fileInput.files[i]);
+      for (let i = 0; i < filesToUpload.length; i++) {
+        formData.append('files', filesToUpload[i]);
       }
       formData.append('model_size', document.getElementById('modelSelect').value);
       formData.append('merge_mode', document.getElementById('mergeCheckbox').checked);
@@ -1657,6 +1702,7 @@ HTML_APP = """<!DOCTYPE html>
           uploadPercentText.textContent = '100%';
           uploadTitle.textContent = '✅ Файл успешно передан серверу! Нейросеть начала обработку...';
           submitBtnText.textContent = '🚀 Запустить транскрибацию';
+          selectedFiles = [];
           fileInput.value = '';
           document.getElementById('filePreviewCard').classList.add('hidden');
           
